@@ -1,0 +1,23 @@
+<Lems>
+
+    <!-- LEMS fixture for the single-compartment HH cell, modelled on
+         NeuroML2/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml. -->
+
+    <Target component="sim1"/>
+
+    <Include file="Cells.xml"/>
+    <Include file="Networks.xml"/>
+    <Include file="Simulation.xml"/>
+    <Include file="hh_single_comp.nml"/>
+
+    <Simulation id="sim1" length="300ms" step="0.01ms" target="net1">
+        <OutputFile id="of0" fileName="results/hh_v.dat">
+            <OutputColumn id="v" quantity="hhpop[0]/v"/>
+        </OutputFile>
+        <OutputFile id="of1" fileName="results/hh_gates.dat">
+            <OutputColumn id="m" quantity="hhpop[0]/bioPhys1/membraneProperties/naChans/naChan/m/q"/>
+            <OutputColumn id="n" quantity="hhpop[0]/bioPhys1/membraneProperties/kChans/kChan/n/q"/>
+        </OutputFile>
+    </Simulation>
+
+</Lems>

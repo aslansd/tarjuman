@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="TwoCellAnalog">
+
+    <!-- Fixture: two two-compartment HH cells coupled by a gap junction and a
+         graded (analog) synapse - the two connection types the C. elegans
+         connectome models in NeuroML rely on. -->
+
+    <ionChannelHH id="passiveChan" conductance="10pS"/>
+
+    <ionChannelHH id="naChan" conductance="10pS" species="na">
+        <gateHHrates id="m" instances="3">
+            <forwardRate type="HHExpLinearRate" rate="1per_ms" midpoint="-40mV" scale="10mV"/>
+            <reverseRate type="HHExpRate" rate="4per_ms" midpoint="-65mV" scale="-18mV"/>
+        </gateHHrates>
+        <gateHHrates id="h" instances="1">
+            <forwardRate type="HHExpRate" rate="0.07per_ms" midpoint="-65mV" scale="-20mV"/>
+            <reverseRate type="HHSigmoidRate" rate="1per_ms" midpoint="-35mV" scale="10mV"/>
+        </gateHHrates>
+    </ionChannelHH>
+
+    <ionChannelHH id="kChan" conductance="10pS" species="k">
+        <gateHHrates id="n" instances="4">
+            <forwardRate type="HHExpLinearRate" rate="0.1per_ms" midpoint="-55mV" scale="10mV"/>
+            <reverseRate type="HHExpRate" rate="0.125per_ms" midpoint="-65mV" scale="-80mV"/>
+        </gateHHrates>
+    </ionChannelHH>
+
+    <gapJunction id="gj1" conductance="0.5nS"/>
+    <silentSynapse id="silent1"/>
+    <gradedSynapse id="gs1" conductance="2nS" delta="5mV" Vth="-35mV" k="0.025per_ms" erev="0mV"/>
+
+    <cell id="twoCompCell">
+        <morphology id="morph">
+            <segment id="0" name="soma">
+                <proximal x="0" y="0" z="0" diameter="10"/>
+                <distal x="0" y="10" z="0" diameter="10"/>
+            </segment>
+            <segment id="1" name="dend">
+                <parent segment="0"/>
+                <proximal x="0" y="10" z="0" diameter="2"/>
+                <distal x="0" y="60" z="0" diameter="2"/>
+            </segment>
+            <segmentGroup id="soma_sec" neuroLexId="sao864921383">
+                <member segment="0"/>
+            </segmentGroup>
+            <segmentGroup id="dend_sec" neuroLexId="sao864921383">
+                <property tag="numberInternalDivisions" value="5"/>
+                <member segment="1"/>
+            </segmentGroup>
+            <segmentGroup id="soma_group">
+                <include segmentGroup="soma_sec"/>
+            </segmentGroup>
+        </morphology>
+
+        <biophysicalProperties id="bioPhys">
+            <membraneProperties>
+                <channelDensity id="leak" ionChannel="passiveChan" condDensity="3.0 S_per_m2" erev="-54.3mV" ion="non_specific"/>
+                <channelDensity id="naChans" ionChannel="naChan" condDensity="120.0 mS_per_cm2" erev="50.0 mV" ion="na" segmentGroup="soma_group"/>
+                <channelDensity id="kChans" ionChannel="kChan" condDensity="360 S_per_m2" erev="-77mV" ion="k" segmentGroup="soma_group"/>
+                <spikeThresh value="-20mV"/>
+                <specificCapacitance value="1.0 uF_per_cm2"/>
+                <initMembPotential value="-65mV"/>
+            </membraneProperties>
+            <intracellularProperties>
+                <resistivity value="0.1 kohm_cm"/>
+            </intracellularProperties>
+        </biophysicalProperties>
+    </cell>
+
+    <pulseGenerator id="pulseGen1" delay="20ms" duration="80ms" amplitude="0.2nA"/>
+
+    <network id="TwoCellNet">
+        <population id="popA" component="twoCompCell" size="1"/>
+        <population id="popB" component="twoCompCell" size="1"/>
+        <population id="popC" component="twoCompCell" size="1"/>
+
+        <electricalProjection id="gjProj" presynapticPopulation="popA" postsynapticPopulation="popB">
+            <electricalConnection id="0" preCell="0" postCell="0" preSegment="1" preFractionAlong="0.5" postSegment="1" postFractionAlong="0.5" synapse="gj1"/>
+        </electricalProjection>
+
+        <continuousProjection id="gradedProj" presynapticPopulation="popA" postsynapticPopulation="popC">
+            <continuousConnection id="0" preCell="0" postCell="0" preComponent="silent1" postComponent="gs1"/>
+        </continuousProjection>
+
+        <inputList id="stim" component="pulseGen1" population="popA">
+            <input id="0" target="../popA/0/twoCompCell" segmentId="0" fractionAlong="0.5" destination="synapses"/>
+        </inputList>
+    </network>
+
+</neuroml>
