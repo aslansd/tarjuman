@@ -9,7 +9,7 @@ Both use the fixtures in `tests/data`, so they run without downloading
 anything. Install the extras first:
 
 ```bash
-pip install tarjuman[examples]
+pip install "tarjuman[examples]"
 ```
 
 To run a LEMS file from the NeuroML2 repository instead:
