@@ -31,8 +31,8 @@ model.module.make_trainable("naChans_m_alpha_midpoint")   # now fit it to data
 pip install tarjuman
 ```
 
-Optional extras: `pip install tarjuman[neuroml]` to read models straight from
-`libNeuroML` objects, `tarjuman[plot]` for the CLI's `--plot`.
+Optional extras: `pip install "tarjuman[neuroml]"` to read models straight from
+`libNeuroML` objects, `"tarjuman[plot]"` for the CLI's `--plot`.
 
 ## Command line
 
