@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tarjuman"
+dynamic = ["version"]
+description = "Run NeuroML 2 models on the Jaxley simulator: GPU-accelerated, differentiable biophysical simulation"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Aslan Satary Dizaji", email = "aslansatary@gmail.com" }]
+keywords = [
+    "neuroml",
+    "jaxley",
+    "jax",
+    "computational neuroscience",
+    "biophysical simulation",
+    "hodgkin-huxley",
+    "openworm",
+    "differentiable simulation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jaxley>=0.11",
+    "jax>=0.4.20",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+neuroml = ["libNeuroML>=0.5.5"]
+plot = ["matplotlib>=3.7"]
+examples = ["matplotlib>=3.7", "optax>=0.2"]
+dev = [
+    "pytest>=7.4",
+    "matplotlib>=3.7",
+    "optax>=0.2",
+    "libNeuroML>=0.5.5",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+tarjuman = "tarjuman.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aslansd/tarjuman"
+Repository = "https://github.com/aslansd/tarjuman"
+Issues = "https://github.com/aslansd/tarjuman/issues"
+"NeuroML" = "https://docs.neuroml.org"
+"Jaxley" = "https://jaxley.readthedocs.io"
+
+[tool.hatch.version]
+path = "tarjuman/_version.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["tarjuman", "tests", "examples", "tools", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tarjuman"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::UserWarning"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
