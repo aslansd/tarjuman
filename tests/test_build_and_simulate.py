@@ -74,7 +74,8 @@ def test_channel_exposes_every_rate_parameter():
     channel = make_channel(document.ion_channels["naChan"], density)
     assert channel.name == "naChans"
     assert channel.channel_params["naChans_gbar"] == pytest.approx(0.12)
-    assert channel.channel_params["naChans_e"] == pytest.approx(50.0)
+    # The reversal potential is "_erev", not "_e": a gate may be called "e".
+    assert channel.channel_params["naChans_erev"] == pytest.approx(50.0)
     assert channel.channel_params["naChans_m_alpha_midpoint"] == pytest.approx(-40.0)
     assert set(channel.channel_states) == {"naChans_m", "naChans_h"}
 
