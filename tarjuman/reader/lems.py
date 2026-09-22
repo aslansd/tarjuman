@@ -107,13 +107,16 @@ def read_lems(
     seen: set[str] = set()
     for output_file in simulation_element:
         if _tag(output_file) == "OutputFile":
+            file_id = output_file.get("id", "out")
             for column in output_file:
                 if _tag(column) != "OutputColumn":
                     continue
                 quantity = column.get("quantity")
                 if quantity not in seen:
                     seen.add(quantity)
-                    simulation.outputs.append((column.get("id"), quantity))
+                    simulation.outputs.append(
+                        (file_id, column.get("id"), quantity)
+                    )
         elif _tag(output_file) == "EventOutputFile":
             for selection in output_file:
                 if _tag(selection) != "EventSelection":
@@ -131,13 +134,16 @@ def read_lems(
         for display in simulation_element:
             if _tag(display) != "Display":
                 continue
+            display_id = display.get("id", "display")
             for line in display:
                 if _tag(line) != "Line":
                     continue
                 quantity = line.get("quantity")
                 if quantity not in seen:
                     seen.add(quantity)
-                    simulation.outputs.append((line.get("id"), quantity))
+                    simulation.outputs.append(
+                        (display_id, line.get("id"), quantity)
+                    )
 
     return document, simulation
 

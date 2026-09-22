@@ -20,6 +20,8 @@ from typing import Iterable, Optional
 
 from .. import ir
 from ..errors import ParseError
+from ..lems.builtins import builtin_registry
+from ..lems.component_types import base_kind_of, read_component_type, resolve_inheritance
 from ..report import ConversionReport
 from ..units import to_jaxley
 
@@ -66,6 +68,11 @@ _INPUT_TAGS = {
     "spikeGeneratorPoisson",
     "poissonFiringSynapse",
     "transientPoissonFiringSynapse",
+}
+_CONCENTRATION_MODEL_TAGS = {
+    "fixedFactorConcentrationModel",
+    "decayingPoolConcentrationModel",
+    "concentrationModel",
 }
 _POINT_CELL_TAGS = {
     "iafCell",
@@ -187,11 +194,26 @@ def _read_q10(element: ET.Element, context: str) -> ir.Q10:
     raise ParseError(f"Unsupported q10Settings type {kind!r} in {context}.")
 
 
-def _read_gate(element: ET.Element, context: str) -> ir.Gate:
+def _read_gate(
+    element: ET.Element, context: str, custom_types: Optional[dict] = None
+) -> ir.Gate:
+    """Read a gate, whether standard or defined by a custom ComponentType."""
+    custom_types = custom_types or {}
     kind = _component_type(element)
     gate_id = element.get("id", "q")
     context = f"{context} gate '{gate_id}'"
     instances = int(float(element.get("instances", "1")))
+
+    if kind in custom_types:
+        # The whole gate is a custom ComponentType (c302's customHGate).
+        return ir.Gate(
+            id=gate_id,
+            instances=instances,
+            kind=kind,
+            custom=ir.CustomComponent(
+                id=gate_id, component_type=kind, attributes=dict(element.attrib)
+            ),
+        )
 
     forward = _first(element, "forwardRate")
     reverse = _first(element, "reverseRate")
@@ -199,27 +221,44 @@ def _read_gate(element: ET.Element, context: str) -> ir.Gate:
     time_course = _first(element, "timeCourse")
     q10 = _first(element, "q10Settings")
 
-    return ir.Gate(
-        id=gate_id,
-        instances=instances,
-        kind=kind,
-        forward_rate=_read_rate(forward, context) if forward is not None else None,
-        reverse_rate=_read_rate(reverse, context) if reverse is not None else None,
-        steady_state=(
-            _read_variable(steady_state, context) if steady_state is not None else None
-        ),
-        time_course=(
-            _read_time_course(time_course, context) if time_course is not None else None
-        ),
-        q10=_read_q10(q10, context) if q10 is not None else None,
-    )
+    gate = ir.Gate(id=gate_id, instances=instances, kind=kind)
+    for part, part_element, reader in (
+        ("forward_rate", forward, _read_rate),
+        ("reverse_rate", reverse, _read_rate),
+        ("steady_state", steady_state, _read_variable),
+        ("time_course", time_course, _read_time_course),
+    ):
+        if part_element is None:
+            continue
+        part_kind = _component_type(part_element)
+        if part_kind in custom_types:
+            # Only this part of the gate is custom (e.g. MuscleSigmoidVariable).
+            gate.custom_parts[part] = ir.CustomComponent(
+                id=part_element.get("id"),
+                component_type=part_kind,
+                attributes=dict(part_element.attrib),
+            )
+        else:
+            setattr(gate, part, reader(part_element, context))
+    gate.q10 = _read_q10(q10, context) if q10 is not None else None
+    return gate
 
 
-def _read_ion_channel(element: ET.Element, report: ConversionReport) -> ir.IonChannel:
+def _read_ion_channel(
+    element: ET.Element,
+    report: ConversionReport,
+    custom_types: Optional[dict] = None,
+) -> ir.IonChannel:
+    custom_types = custom_types or {}
     channel_id = element.get("id")
     context = f"ionChannel '{channel_id}'"
+    gate_tags = set(_GATE_TAGS) | {
+        name
+        for name, component in custom_types.items()
+        if component[1] == "gate"
+    }
     gates: list[ir.Gate] = []
-    for gate_element in _children(element, *_GATE_TAGS):
+    for gate_element in _children(element, *gate_tags):
         gate_kind = _component_type(gate_element)
         if gate_kind in ("gateKS", "gateFractional"):
             report.unsupported(
@@ -228,7 +267,7 @@ def _read_ion_channel(element: ET.Element, report: ConversionReport) -> ir.IonCh
                 "and fractional gates are not yet translated, the gate is skipped",
             )
             continue
-        gates.append(_read_gate(gate_element, context))
+        gates.append(_read_gate(gate_element, context, custom_types))
 
     conductance = element.get("conductance")
     scaling = _first(element, "q10ConductanceScaling")
@@ -404,10 +443,26 @@ def _read_biophysics(
             intracellular, "resistivity", "resistivity", context
         )
         for species in _children(intracellular, "species"):
-            report.unsupported(
-                context,
-                f"<species id='{species.get('id')}'> describes an ion pool "
-                "(e.g. calcium buffering) that tarjuman does not yet translate",
+            species_context = f"{context} species '{species.get('id')}'"
+            biophysics.species.append(
+                ir.Species(
+                    id=species.get("id"),
+                    concentration_model=species.get("concentrationModel"),
+                    ion=species.get("ion", "ca"),
+                    initial_concentration=to_jaxley(
+                        species.get("initialConcentration"),
+                        "concentration",
+                        species_context,
+                        default=0.0,
+                    ),
+                    initial_ext_concentration=to_jaxley(
+                        species.get("initialExtConcentration"),
+                        "concentration",
+                        species_context,
+                        default=2.0,
+                    ),
+                    segment_group=species.get("segmentGroup", "all") or "all",
+                )
             )
     return biophysics
 
@@ -476,6 +531,14 @@ _SYNAPSE_PARAM_DIMENSIONS = {
     "baselineAmplitude": "current",
     "averageRate": "per_time",
     "weight": "none",
+    # point cells
+    "C": "capacitance",
+    "leakConductance": "conductance",
+    "leakReversal": "voltage",
+    "thresh": "voltage",
+    "reset": "voltage",
+    "refract": "time",
+    "tau": "time",
     # gradedSynapse / gapJunction
     "delta": "voltage",
     "k": "per_time",
@@ -680,21 +743,43 @@ def read_neuroml(
     except ET.ParseError as error:  # pragma: no cover - malformed input
         raise ParseError(f"Could not parse {path}: {error}") from error
 
-    document = _read_root(root, report)
-    document.source = str(path)
-
+    # Included files are read first: they may define the ComponentTypes this
+    # file uses, and a custom gate cannot be read without its definition.
+    included_documents: list[ir.Document] = []
     if follow_includes:
-        for href in list(document.includes):
+        for href in _include_hrefs(root):
             included = (path.parent / href).resolve()
             if not included.exists():
                 # Core NeuroML type definitions (Cells.xml, Channels.xml, ...)
                 # are built into tarjuman and need not be resolved.
                 report.info("include", f"skipping unresolved include '{href}'")
                 continue
-            document.merge(
+            included_documents.append(
                 read_neuroml(included, report, follow_includes, _seen=seen)
             )
+
+    inherited_types: dict = {}
+    for included_document in included_documents:
+        inherited_types.update(included_document.component_types)
+
+    document = _read_root(root, report, inherited_types)
+    document.source = str(path)
+    for included_document in included_documents:
+        merged = ir.Document()
+        merged.merge(included_document)
+        merged.merge(document)
+        document.merge(included_document)
     return document
+
+
+def _include_hrefs(root: ET.Element) -> list[str]:
+    hrefs = []
+    for element in root:
+        if _tag(element) == "include":
+            href = element.get("href") or element.get("file")
+            if href:
+                hrefs.append(href)
+    return hrefs
 
 
 def read_neuroml_string(
@@ -705,17 +790,82 @@ def read_neuroml_string(
     return _read_root(ET.fromstring(text), report)
 
 
-def _read_root(root: ET.Element, report: ConversionReport) -> ir.Document:
+def collect_component_types(
+    root: ET.Element, inherited: Optional[dict] = None
+) -> tuple[dict, dict]:
+    """Read every ``<ComponentType>`` in a document.
+
+    Returns ``(definitions, usable)`` where ``definitions`` maps name ->
+    :class:`~tarjuman.lems.component_types.ComponentType` (inheritance
+    resolved) and ``usable`` maps name -> ``(component, base kind)`` for those
+    whose base type tarjuman can attach to.
+    """
+    registry = builtin_registry()
+    registry.update(inherited or {})
+
+    raw: dict = {}
+    for element in root.iter():
+        if _tag(element) == "ComponentType":
+            component = read_component_type(element)
+            raw[component.name] = component
+    registry.update(raw)
+
+    definitions: dict = {}
+    usable: dict = {}
+    for name in raw:
+        resolved = resolve_inheritance(registry[name], registry)
+        definitions[name] = resolved
+        kind = base_kind_of(registry[name], registry)
+        if kind is not None:
+            usable[name] = (resolved, kind)
+    return definitions, usable
+
+
+def _read_root(
+    root: ET.Element,
+    report: ConversionReport,
+    inherited_types: Optional[dict] = None,
+) -> ir.Document:
     document = ir.Document(id=root.get("id"))
+
+    definitions, custom_types = collect_component_types(root, inherited_types)
+    document.component_types.update(definitions)
+    # Custom types defined in files included earlier are usable here too.
+    for name, component in (inherited_types or {}).items():
+        kind = base_kind_of(component, {**builtin_registry(), **(inherited_types or {})})
+        if kind is not None and name not in custom_types:
+            custom_types[name] = (component, kind)
 
     for element in root:
         tag = _tag(element)
+        if tag == "ComponentType":
+            continue
+        if tag in _CONCENTRATION_MODEL_TAGS or (
+            tag in custom_types and custom_types[tag][1] == "concentration_model"
+        ):
+            document.concentration_models[element.get("id")] = ir.ConcentrationModel(
+                id=element.get("id"),
+                kind=tag,
+                ion=element.get("ion", "ca"),
+                attributes=dict(element.attrib),
+            )
+            continue
+        if tag in custom_types and custom_types[tag][1] == "synapse":
+            synapse_id = element.get("id")
+            document.synapses[synapse_id] = ir.Synapse(
+                id=synapse_id,
+                kind=tag,
+                custom=ir.CustomComponent(
+                    id=synapse_id, component_type=tag, attributes=dict(element.attrib)
+                ),
+            )
+            continue
         if tag == "include":
             href = element.get("href") or element.get("file")
             if href:
                 document.includes.append(href)
         elif tag in _ION_CHANNEL_TAGS:
-            channel = _read_ion_channel(element, report)
+            channel = _read_ion_channel(element, report, custom_types)
             if tag == "ionChannelVShift":
                 report.approximation(
                     f"ionChannelVShift '{channel.id}'",
