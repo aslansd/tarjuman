@@ -27,9 +27,11 @@ import numpy as np
 from jaxley.connect import connect
 
 from . import ir
+from .cells import build_point_cell, point_cell_threshold
 from .channels import DEFAULT_TEMPERATURE, NeuroMLChannel, make_channel
 from .errors import ParseError
 from .morphology import CellMorphology, build_morphology
+from .pumps import ion_current_name, make_concentration_model
 from .report import ConversionReport
 from .synapses import DEFAULT_SPIKE_THRESHOLD, make_synapse
 
@@ -238,6 +240,9 @@ def build_cell(
         return cell, morphology
 
     _apply_passive_properties(cell, morphology, biophysics, report, cell_id)
+    pools = _insert_concentration_models(
+        cell, morphology, biophysics, document, report, cell_id
+    )
     _insert_channels(
         cell,
         morphology,
@@ -247,6 +252,7 @@ def build_cell(
         temperature,
         erev_overrides,
         cell_id,
+        pools,
     )
     return cell, morphology
 
@@ -295,6 +301,45 @@ def _apply_passive_properties(
             view.set("v", value)
 
 
+def _insert_concentration_models(
+    cell,
+    morphology: CellMorphology,
+    biophysics: ir.BiophysicalProperties,
+    document: ir.Document,
+    report: ConversionReport,
+    cell_id: str,
+) -> dict[str, ir.Species]:
+    """Insert a Jaxley pump for every ``<species>`` on the cell.
+
+    Returns the species by ion, so that channels of that ion can be given a
+    shared current name for the pool to read.
+    """
+    pools: dict[str, ir.Species] = {}
+    for species in biophysics.species:
+        model = document.concentration_models.get(species.concentration_model)
+        if model is None:
+            report.unsupported(
+                f"cell '{cell_id}' species '{species.id}'",
+                f"references unknown concentration model "
+                f"'{species.concentration_model}'; the pool is skipped and any "
+                "calcium-dependent gate will see a constant concentration",
+            )
+            continue
+        try:
+            pump = make_concentration_model(model, document.component_types, species)
+        except Exception as error:
+            report.unsupported(f"cell '{cell_id}' species '{species.id}'", str(error))
+            continue
+        for view in _views_for_group(cell, morphology, species.segment_group):
+            view.insert(pump)
+        pools[species.ion] = species
+        report.info(
+            f"cell '{cell_id}'",
+            f"concentration model '{model.id}' ({model.kind}) tracks {species.ion}",
+        )
+    return pools
+
+
 def _insert_channels(
     cell,
     morphology: CellMorphology,
@@ -304,7 +349,9 @@ def _insert_channels(
     temperature: float,
     erev_overrides: dict[str, float],
     cell_id: str,
+    pools: Optional[dict[str, ir.Species]] = None,
 ) -> None:
+    pools = pools or {}
     for density in biophysics.channel_densities:
         channel_ir = document.ion_channels.get(density.ion_channel)
         if channel_ir is None:
@@ -314,12 +361,25 @@ def _insert_channels(
                 "the channel is skipped",
             )
             continue
-        channel = make_channel(
-            channel_ir,
-            density,
-            temperature=temperature,
-            erev_override=erev_overrides.get(density.id),
-        )
+        ion = (density.ion or channel_ir.species or "").lower()
+        species = pools.get(ion)
+        try:
+            channel = make_channel(
+                channel_ir,
+                density,
+                temperature=temperature,
+                erev_override=erev_overrides.get(density.id),
+                component_types=document.component_types,
+                # Channels of a pooled ion share a current name so the pool
+                # sees the total current of that ion, as NeuroML's `iCa` does.
+                current_name=ion_current_name(ion) if species is not None else None,
+                initial_calcium=(
+                    pools["ca"].initial_concentration if "ca" in pools else 5e-5
+                ),
+            )
+        except Exception as error:
+            report.unsupported(f"channelDensity '{density.id}'", str(error))
+            continue
         for view in _views_for_group(cell, morphology, density.segment_group):
             view.insert(channel)
 
@@ -378,13 +438,16 @@ def build_network(
 
     for population in network_ir.populations:
         component = population.component
-        if component in document.point_cells:
-            report.unsupported(
-                f"population '{population.id}'",
-                f"component '{component}' is an abstract point cell "
-                f"({document.point_cells[component].kind}); the population is skipped",
-            )
-            continue
+        if component in document.point_cells and component not in prototypes:
+            try:
+                prototype, morphology = build_point_cell(
+                    document.point_cells[component], report
+                )
+            except Exception as error:
+                report.unsupported(f"population '{population.id}'", str(error))
+                continue
+            prototypes[component] = prototype
+            morphologies[component] = morphology
         if component in document.input_sources:
             report.unsupported(
                 f"population '{population.id}'",
@@ -393,7 +456,7 @@ def build_network(
                 "sources are not translated, so anything they drive will be silent",
             )
             continue
-        if component not in prototypes:
+        if component not in prototypes and component in document.cells:
             prototype, morphology = build_cell(
                 document,
                 component,
@@ -405,6 +468,8 @@ def build_network(
             )
             prototypes[component] = prototype
             morphologies[component] = morphology
+        if component not in prototypes:
+            continue
         indices = (
             [instance.id for instance in population.instances]
             if population.instances
@@ -433,6 +498,7 @@ def build_network(
         )
 
     net = jx.Network(cells)
+    _reregister_pumped_ions(net)
     _place_cells(net, network_ir, cell_index)
 
     model = ConvertedModel(
@@ -457,6 +523,20 @@ def build_network(
     return model
 
 
+def _reregister_pumped_ions(net) -> None:
+    """Re-register pumped ions on a network built from cells.
+
+    Jaxley collects the pumps of the cells a ``Network`` is built from, but not
+    the list of ion concentrations those pumps modify, so the integrator does
+    not know it has to solve for them. Until that is fixed upstream, tarjuman
+    restores the list here.
+    """
+    for pump in net.base.pumps:
+        ion_name = getattr(pump, "ion_name", None)
+        if ion_name is not None and ion_name not in net.base.pumped_ions:
+            net.base.pumped_ions.append(ion_name)
+
+
 def _place_cells(net, network_ir: ir.Network, cell_index) -> None:
     """Move each cell to the location its ``<instance>`` gives, if any."""
     for population in network_ir.populations:
@@ -473,6 +553,12 @@ def _place_cells(net, network_ir: ir.Network, cell_index) -> None:
 
 
 def _spike_threshold(document: ir.Document, cell_id: Optional[str]) -> float:
+    if cell_id in document.point_cells:
+        # An integrate-and-fire cell never overshoots: the only voltage that
+        # marks a spike is its own threshold.
+        threshold = point_cell_threshold(document.point_cells[cell_id])
+        if threshold is not None:
+            return threshold
     if cell_id is None or cell_id not in document.cells:
         return DEFAULT_SPIKE_THRESHOLD
     biophysics = document.cells[cell_id].biophysical_properties
@@ -502,7 +588,12 @@ def _synapse_for(
         )
         return None
     try:
-        synapse = make_synapse(synapse_ir, name=component_id, threshold=threshold)
+        synapse = make_synapse(
+            synapse_ir,
+            name=component_id,
+            threshold=threshold,
+            component_types=document.component_types,
+        )
     except Exception as error:
         report.unsupported(context, str(error))
         return None

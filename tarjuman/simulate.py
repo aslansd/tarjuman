@@ -25,6 +25,14 @@ from .report import ConversionReport
 
 __all__ = ["SimulationResult", "simulate", "run_lems", "from_neuroml"]
 
+#: LEMS cell exposures for ion concentrations, and the Jaxley state they map to.
+_ION_CONCENTRATION_STATES = {
+    "caConc": "CaCon_i",
+    "caConcExt": "CaCon_e",
+    "naConc": "NaCon_i",
+    "kConc": "KCon_i",
+}
+
 
 @dataclass
 class SimulationResult:
@@ -194,19 +202,28 @@ def run_lems(
         **kwargs,
     )
 
-    records = [quantity for _, quantity in simulation.outputs] or None
+    records = [quantity for _, _, quantity in simulation.outputs] or None
     result = simulate(
         model,
         t_max=simulation.length,
         delta_t=delta_t if delta_t is not None else simulation.step,
         records=records,
     )
-    # Present the traces under the ids the LEMS file gave them.
+    # Present the traces under the ids the LEMS file gave them.  Column ids are
+    # only unique within one OutputFile, so a repeated id is qualified with the
+    # file it came from rather than silently overwriting the earlier trace.
     if simulation.outputs:
+        counts: dict[str, int] = {}
+        for _, column_id, _ in simulation.outputs:
+            counts[column_id] = counts.get(column_id, 0) + 1
+
         renamed, quantities = {}, {}
-        for (column_id, quantity), key in zip(simulation.outputs, result.traces):
-            renamed[column_id] = result.traces[key]
-            quantities[column_id] = quantity
+        for (file_id, column_id, quantity), key in zip(
+            simulation.outputs, result.traces
+        ):
+            name = column_id if counts[column_id] == 1 else f"{file_id}.{column_id}"
+            renamed[name] = result.traces[key]
+            quantities[name] = quantity
         result.traces, result.quantities = renamed, quantities
     return result, model
 
@@ -244,6 +261,9 @@ def _add_recording(model: ConvertedModel, quantity: str) -> str:
     state = parsed["state"]
     if state == "v":
         jaxley_state = "v"
+    elif state in _ION_CONCENTRATION_STATES:
+        # A cell's exposed ion concentration, e.g. "AVBL/0/GenericNeuronCell/caConc".
+        jaxley_state = _ION_CONCENTRATION_STATES[state]
     elif parsed["density"] is not None and parsed["gate"] is not None:
         # Jaxley names gate states "<channelDensity id>_<gate id>".
         jaxley_state = f"{parsed['density']}_{parsed['gate']}"

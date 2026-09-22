@@ -34,7 +34,7 @@ from typing import Optional
 from ._units_table import DIMENSIONS, UNITS
 from .errors import UnitError
 
-__all__ = ["parse_quantity", "to_jaxley", "convert", "JAXLEY_UNITS"]
+__all__ = ["parse_quantity", "to_jaxley", "convert", "to_si", "JAXLEY_UNITS"]
 
 # SI value -> Jaxley value, per LEMS dimension name.
 _SI_TO_JAXLEY: dict[str, float] = {
@@ -166,6 +166,18 @@ def convert(si_value: float, dimension: str) -> float:
             )
         raise UnitError(f"Unknown LEMS dimension {dimension!r}.")
     return si_value * _SI_TO_JAXLEY[dimension]
+
+
+def to_si(jaxley_value, dimension: str):
+    """Convert a value in Jaxley units back into SI.
+
+    The inverse of :func:`convert`.  Needed when evaluating LEMS expressions,
+    which are only guaranteed to be dimensionally correct in a coherent unit
+    system; Jaxley's units are convenient rather than coherent.
+    """
+    if dimension not in _SI_TO_JAXLEY:
+        raise UnitError(f"Unknown LEMS dimension {dimension!r}.")
+    return jaxley_value / _SI_TO_JAXLEY[dimension]
 
 
 def _ctx(context: str) -> str:

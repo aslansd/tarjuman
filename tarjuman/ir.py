@@ -21,6 +21,9 @@ __all__ = [
     "Q10",
     "Gate",
     "IonChannel",
+    "CustomComponent",
+    "ConcentrationModel",
+    "Species",
     "VariableParameter",
     "ChannelDensity",
     "Segment",
@@ -104,12 +107,30 @@ class Gate:
     id: str
     instances: int
     kind: str  # gateHHrates | gateHHtauInf | gateHHratesTau | gateHHratesInf
-    # | gateHHratesTauInf | gateHHInstantaneous
+    # | gateHHratesTauInf | gateHHInstantaneous | a custom ComponentType name
     forward_rate: Optional[Rate] = None
     reverse_rate: Optional[Rate] = None
     steady_state: Optional[Variable] = None
     time_course: Optional[TimeCourse] = None
     q10: Optional[Q10] = None
+    #: For gates whose rate, steadyState or timeCourse is a custom LEMS
+    #: ComponentType: the component name and its raw attributes, kept
+    #: unconverted because their dimensions come from the ComponentType.
+    custom: Optional["CustomComponent"] = None
+    custom_parts: dict[str, "CustomComponent"] = field(default_factory=dict)
+
+    @property
+    def is_custom(self) -> bool:
+        return self.custom is not None or bool(self.custom_parts)
+
+
+@dataclass
+class CustomComponent:
+    """An instance of a custom LEMS ComponentType, with its raw attributes."""
+
+    id: Optional[str]
+    component_type: str
+    attributes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -206,6 +227,29 @@ class SegmentGroup:
 
 
 @dataclass
+class ConcentrationModel:
+    """A NeuroML concentration model (``fixedFactorConcentrationModel``, ...)."""
+
+    id: str
+    kind: str
+    ion: str = "ca"
+    #: Raw attributes; dimensions come from the (built-in or custom) ComponentType.
+    attributes: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Species:
+    """A ``<species>`` inside ``intracellularProperties``: an ion pool on a cell."""
+
+    id: str
+    concentration_model: str
+    ion: str = "ca"
+    initial_concentration: float = 0.0  # mM
+    initial_ext_concentration: float = 2.0  # mM
+    segment_group: str = "all"
+
+
+@dataclass
 class Morphology:
     id: str
     segments: dict[int, Segment] = field(default_factory=dict)
@@ -220,6 +264,7 @@ class BiophysicalProperties:
     init_memb_potential: list[tuple[float, str]] = field(default_factory=list)
     resistivity: list[tuple[float, str]] = field(default_factory=list)
     spike_thresh: list[tuple[float, str]] = field(default_factory=list)
+    species: list[Species] = field(default_factory=list)
 
 
 @dataclass
@@ -251,6 +296,8 @@ class Synapse:
     id: str
     kind: str
     params: dict[str, float] = field(default_factory=dict)
+    #: Set when ``kind`` is a custom LEMS ComponentType rather than a core one.
+    custom: Optional[CustomComponent] = None
 
 
 @dataclass
@@ -351,6 +398,9 @@ class Document:
     synapses: dict[str, Synapse] = field(default_factory=dict)
     input_sources: dict[str, InputSource] = field(default_factory=dict)
     networks: dict[str, Network] = field(default_factory=dict)
+    concentration_models: dict[str, ConcentrationModel] = field(default_factory=dict)
+    #: Custom LEMS ComponentTypes defined by the document, by name.
+    component_types: dict[str, object] = field(default_factory=dict)
     includes: list[str] = field(default_factory=list)
 
     def merge(self, other: "Document") -> "Document":
@@ -362,6 +412,8 @@ class Document:
             "synapses",
             "input_sources",
             "networks",
+            "concentration_models",
+            "component_types",
         ):
             getattr(self, attr).update(getattr(other, attr))
         self.includes.extend(other.includes)
@@ -377,7 +429,10 @@ class SimulationSpec:
     length: float  # ms
     step: float  # ms
     seed: Optional[int] = None
-    #: (column id, LEMS quantity path) pairs from ``OutputFile``/``Display``.
-    outputs: list[tuple[str, str]] = field(default_factory=list)
+    #: ``(file or display id, column id, LEMS quantity path)`` from every
+    #: ``OutputFile`` and, failing that, every ``Display``.  The file id is
+    #: kept because column ids are only unique within a file: c302 names both
+    #: the voltage column and the calcium column of a cell ``AVBL_v``.
+    outputs: list[tuple[str, str, str]] = field(default_factory=list)
     #: (event id, LEMS quantity path, threshold) from ``EventOutputFile``.
     event_outputs: list[tuple[str, str, float]] = field(default_factory=list)
