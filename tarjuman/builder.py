@@ -785,15 +785,17 @@ def build(
     Returns:
         A :class:`ConvertedModel`.
     """
+    report = kwargs.pop("report", None) or ConversionReport(source=document.source)
     if cell_id is not None or not document.networks:
         if cell_id is None:
             if len(document.cells) != 1:
                 raise ParseError(
                     "The document defines no network and "
-                    f"{len(document.cells)} cells; pass cell_id to choose one."
+                    f"{len(document.cells)} cells"
+                    + ("; pass cell_id to choose one." if document.cells else ".")
+                    + report.missing_includes_hint()
                 )
             cell_id = next(iter(document.cells))
-        report = kwargs.pop("report", None) or ConversionReport(source=document.source)
         temperature = kwargs.pop("temperature", None) or DEFAULT_TEMPERATURE
         cell, morphology = build_cell(
             document, cell_id, report=report, temperature=temperature, **kwargs
@@ -809,4 +811,4 @@ def build(
             cell_types=[cell_id],
             temperature=temperature,
         )
-    return build_network(document, network_id=network_id, **kwargs)
+    return build_network(document, network_id=network_id, report=report, **kwargs)

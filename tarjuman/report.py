@@ -43,6 +43,10 @@ class ConversionReport:
     segment_map: dict[tuple[str, int], tuple[int, int, int]] = field(
         default_factory=dict
     )
+    #: Includes that could not be found on disk, as ``(href, searched path)``.
+    #: A LEMS or NeuroML file is only a pointer to the files it includes, so an
+    #: unresolved one usually means the model was run away from its siblings.
+    unresolved_includes: list[tuple[str, str]] = field(default_factory=list)
     n_cells: int = 0
     n_branches: int = 0
     n_compartments: int = 0
@@ -56,6 +60,28 @@ class ConversionReport:
         note = Note("approximation", component, message)
         self.notes.append(note)
         warnings.warn(str(note), ConversionWarning, stacklevel=2)
+
+    def missing_include(self, href: str, searched: str) -> None:
+        """Record an ``<include>``/``<Include>`` that could not be resolved."""
+        self.unresolved_includes.append((href, searched))
+        self.approximation(
+            "include",
+            f"could not find '{href}' (looked in {searched}); anything it defines "
+            "is missing from the model",
+        )
+
+    def missing_includes_hint(self) -> str:
+        """A sentence naming the unresolved includes, for error messages."""
+        if not self.unresolved_includes:
+            return ""
+        names = ", ".join(f"'{href}'" for href, _ in self.unresolved_includes)
+        directory = self.unresolved_includes[0][1]
+        return (
+            f" The file includes {names}, which could not be found in {directory}. "
+            "A LEMS or NeuroML file only points at the files it includes, and "
+            "those paths are relative to it, so run it where it lives (or give "
+            "the full path to it) rather than copying it somewhere else."
+        )
 
     def unsupported(self, component: str, message: str) -> None:
         note = Note("unsupported", component, message)
