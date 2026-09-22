@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 — unreleased
+
+- Unresolved `<include>` / `<Include>` elements are now reported instead of
+  skipped quietly. A LEMS file only points at the NeuroML files it includes,
+  and those paths are relative to it, so running one away from its siblings
+  used to produce a baffling "the document defines no network and 0 cells".
+  The error now names the files it could not find, says where it looked, and
+  explains that the LEMS file should be run where it lives. Core NeuroML type
+  definitions (`Cells.xml`, `Channels.xml`, …) are still skipped silently,
+  since tarjuman implements them natively.
+
 ## 0.2.0 — unreleased
 
 Built against the OpenWorm models: c302 parameter sets A, C, C0, C1 and C2 now

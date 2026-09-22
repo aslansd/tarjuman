@@ -56,6 +56,11 @@ of [c302](https://github.com/openworm/c302):
 tarjuman run c302/examples/LEMS_c302_C_Oscillator.xml --plot oscillator.png
 ```
 
+Point at the LEMS file where it lives: it includes the NeuroML files beside it
+(`c302_C_Oscillator.net.nml`, `cell_C.xml`) by relative path, so copying it
+elsewhere on its own leaves it with nothing to simulate. tarjuman says which
+includes it could not find if that happens.
+
 | c302 parameter set | what it needs | status |
 |---|---|---|
 | **A** | `iafCell` populations, `expTwoSynapse` | ✅ runs |
@@ -209,7 +214,7 @@ The package is checked against things that do not depend on it:
   targeting, and `(segment, fractionAlong)` → `(branch, compartment)` mapping.
 
 ```bash
-pytest          # 88 tests
+pytest          # 90 tests
 ```
 
 ## Design notes
