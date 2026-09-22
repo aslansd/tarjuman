@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+Built against the OpenWorm models: c302 parameter sets A, C, C0, C1 and C2 now
+convert and run.
+
+### A LEMS ComponentType interpreter
+
+Real NeuroML models define their own component types; every c302 parameter set
+does. `tarjuman.lems` now parses `<ComponentType>` definitions, resolves
+inheritance, and compiles `<Dynamics>` into JAX:
+
+- an expression parser for the LEMS infix syntax (`^` right-associative, the
+  `.gt.`/`.and.` word operators, the LEMS function set), compiled to closures;
+- `StateVariable`, `DerivedVariable`, `ConditionalDerivedVariable`,
+  `TimeDerivative`, `OnStart`, `OnCondition`, `OnEvent`;
+- state variables advanced by exponential Euler with local linearisation;
+- evaluation in SI, converted at the boundary from the dimensions the
+  ComponentType declares.
+
+Custom types can act as gates (including a custom `fcond`), as the rate,
+steady state or time course inside a standard gate, as concentration models,
+and as synapses, where `select="peer/v"` resolves to the presynaptic voltage.
+
+### Ion concentrations
+
+- `<species>` plus `fixedFactorConcentrationModel` /
+  `decayingPoolConcentrationModel` (and custom pools) become Jaxley pumps.
+- Channels of a pooled ion share a current name, so a pool sees the total
+  current of that ion as NeuroML's `iCa` requirement expects.
+- Gates can depend on `caConc`; `caConc` can be recorded from LEMS.
+
+### Point cells
+
+- `iafCell`, `iafRefCell`, `iafTauCell` and `iafTauRefCell` become
+  single-compartment cells with area-scaled densities; the threshold reset is
+  approximated with a large conductance towards the reset potential and
+  reported as an approximation.
+- Presynaptic spike detection uses a point cell's own threshold.
+
+### Fixes
+
+- A channel's reversal potential is now `{channel}_erev`. It was `{channel}_e`,
+  which collided with a gate named `e` (Boyle & Cohen's calcium activation
+  gate) — Jaxley keeps parameters and states in one table, so the two
+  overwrote each other and flipped the sign of the calcium current. Any
+  remaining collision now raises.
+- Point-cell conductances were read as nS rather than µS, a 1000x error.
+- Duplicate LEMS `OutputColumn` ids (c302 names both the voltage and the
+  calcium column of a cell `AVBL_v`) no longer overwrite each other.
+- `<DerivedVariable select=...>` and `<Regime>` no longer fail at parse time;
+  they fail only if the component is instantiated, with an explanation.
+- Included files are read before the including file, so a channel can use a
+  ComponentType defined in an include.
+- `simulate(..., apply_stimuli=False)` no longer deletes stimuli the caller set.
+
+### Workarounds for upstream Jaxley gaps
+
+- `jx.Network(cells)` does not carry over the pumped-ion list from its cells;
+  tarjuman restores it so the integrator solves for the concentrations.
+
 ## 0.1.0 — unreleased
 
 First working version.
