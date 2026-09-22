@@ -22,24 +22,9 @@ from .. import ir
 from ..errors import ParseError
 from ..report import ConversionReport
 from ..units import to_jaxley
-from .nml import _tag, read_neuroml
+from .nml import CORE_DEFINITION_FILES, _tag, read_neuroml
 
 __all__ = ["read_lems", "parse_quantity_path"]
-
-#: Core LEMS/NeuroML definition files that tarjuman implements natively.
-CORE_DEFINITION_FILES = {
-    "NeuroML2CoreTypes.xml",
-    "NeuroMLCoreCompTypes.xml",
-    "NeuroMLCoreDimensions.xml",
-    "Cells.xml",
-    "Channels.xml",
-    "Inputs.xml",
-    "Networks.xml",
-    "PyNN.xml",
-    "Simulation.xml",
-    "Synapses.xml",
-}
-
 
 def read_lems(
     path: str | os.PathLike, report: Optional[ConversionReport] = None
@@ -67,7 +52,7 @@ def read_lems(
             continue
         included = (path.parent / href).resolve()
         if not included.exists():
-            report.info("Include", f"skipping unresolved include '{href}'")
+            report.missing_include(href, str(path.parent))
             continue
         document.merge(read_neuroml(included, report))
 

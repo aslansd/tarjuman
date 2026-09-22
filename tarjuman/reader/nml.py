@@ -27,6 +27,21 @@ from ..units import to_jaxley
 
 __all__ = ["read_neuroml", "read_neuroml_string"]
 
+#: Core LEMS/NeuroML definition files that tarjuman implements natively.
+CORE_DEFINITION_FILES = {
+    "NeuroML2CoreTypes.xml",
+    "NeuroMLCoreCompTypes.xml",
+    "NeuroMLCoreDimensions.xml",
+    "Cells.xml",
+    "Channels.xml",
+    "Inputs.xml",
+    "Networks.xml",
+    "PyNN.xml",
+    "Simulation.xml",
+    "Synapses.xml",
+}
+
+
 # Component types we understand, grouped by the IR object they produce.
 _ION_CHANNEL_TAGS = {
     "ionChannel",
@@ -751,8 +766,11 @@ def read_neuroml(
             included = (path.parent / href).resolve()
             if not included.exists():
                 # Core NeuroML type definitions (Cells.xml, Channels.xml, ...)
-                # are built into tarjuman and need not be resolved.
-                report.info("include", f"skipping unresolved include '{href}'")
+                # are built into tarjuman and need not be resolved; anything
+                # else is a piece of the model that is genuinely missing.
+                if Path(href).name in CORE_DEFINITION_FILES:
+                    continue
+                report.missing_include(href, str(path.parent))
                 continue
             included_documents.append(
                 read_neuroml(included, report, follow_includes, _seen=seen)
