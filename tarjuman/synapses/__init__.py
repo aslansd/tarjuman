@@ -28,8 +28,10 @@ from jaxley.synapses import Synapse
 
 from .. import ir
 from ..errors import UnsupportedComponentError
+from .lems_synapse import LemsSynapse, make_lems_synapse
 
 __all__ = [
+    "LemsSynapse",
     "ExpTwoSynapse",
     "BlockingPlasticSynapse",
     "GapJunction",
@@ -386,6 +388,7 @@ def make_synapse(
     synapse: ir.Synapse,
     name: Optional[str] = None,
     threshold: float = DEFAULT_SPIKE_THRESHOLD,
+    component_types: Optional[dict] = None,
 ) -> Synapse:
     """Build the Jaxley synapse matching a NeuroML synapse component.
 
@@ -403,6 +406,12 @@ def make_synapse(
     name = name or synapse.id
     params = synapse.params
     kind = synapse.kind
+
+    if synapse.custom is not None:
+        # A synapse type the model defines for itself.
+        from .lems_synapse import make_lems_synapse
+
+        return make_lems_synapse(synapse, component_types or {}, name=name)
 
     if kind == "blockingPlasticSynapse" and "blockConcentration" in params:
         return BlockingPlasticSynapse(
