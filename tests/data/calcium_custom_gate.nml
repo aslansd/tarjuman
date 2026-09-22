@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="CalciumCustomGate">
+
+    <!-- Fixture modelled on c302 parameter set C (Boyle & Cohen 2008): a
+         voltage-gated calcium channel whose third gate is a custom LEMS
+         ComponentType reading the calcium concentration, plus the calcium pool
+         that concentration comes from. -->
+
+    <ionChannelHH id="Leak" conductance="10pS" type="ionChannelPassive"/>
+
+    <ionChannelHH id="k_slow" conductance="10pS" species="k">
+        <gateHHtauInf id="n" instances="1">
+            <timeCourse type="fixedTimeCourse" tau="25.0007 ms"/>
+            <steadyState type="HHSigmoidVariable" rate="1" scale="15.8512 mV" midpoint="19.8741 mV"/>
+        </gateHHtauInf>
+    </ionChannelHH>
+
+    <ionChannelHH id="ca_boyle" conductance="10pS" species="ca">
+        <gateHHtauInf id="e" instances="2">
+            <timeCourse type="fixedTimeCourse" tau="0.100027 ms"/>
+            <steadyState type="HHSigmoidVariable" rate="1" scale="6.74821 mV" midpoint="-3.3568 mV"/>
+        </gateHHtauInf>
+        <gateHHtauInf id="f" instances="1">
+            <timeCourse type="fixedTimeCourse" tau="150.88 ms"/>
+            <steadyState type="HHSigmoidVariable" rate="1" scale="-5.03176 mV" midpoint="25.1815 mV"/>
+        </gateHHtauInf>
+        <customHGate id="h" instances="1" alpha="0.282473" ca_half="6.41889e-8 mM" k="-1.00056e-8 mM"/>
+    </ionChannelHH>
+
+    <ComponentType name="customHGate" extends="gateHHtauInf" description="Custom gate for h">
+        <Parameter name="alpha" dimension="none"/>
+        <Parameter name="k" dimension="concentration"/>
+        <Parameter name="ca_half" dimension="concentration"/>
+        <Constant name="SEC" dimension="time" value="1s"/>
+        <Exposure name="tau" dimension="time"/>
+        <Exposure name="inf" dimension="none"/>
+        <Requirement name="caConc" dimension="concentration"/>
+        <Dynamics>
+            <DerivedVariable name="rateScale" exposure="rateScale" dimension="none" value="1"/>
+            <DerivedVariable name="inf" dimension="none" exposure="inf" value="1 / (1 + (exp( (ca_half - caConc) / k)))"/>
+            <DerivedVariable name="tau" dimension="time" exposure="tau" value="0 * SEC"/>
+            <DerivedVariable name="q" exposure="q" dimension="none" value="inf"/>
+            <DerivedVariable name="fcond" exposure="fcond" dimension="none" value="1 +((q-1) * alpha)"/>
+        </Dynamics>
+    </ComponentType>
+
+    <fixedFactorConcentrationModel id="CaPool" ion="ca" restingConc="0 mM" decayConstant="11.5943 ms" rho="0.000238919 mol_per_m_per_A_per_s"/>
+
+    <cell id="CalciumCell">
+        <morphology id="morphology_CalciumCell">
+            <segment id="0" name="soma">
+                <proximal x="0.0" y="0.0" z="0.0" diameter="5.0"/>
+                <distal x="0.0" y="5.0" z="0.0" diameter="5.0"/>
+            </segment>
+        </morphology>
+        <biophysicalProperties id="biophys">
+            <membraneProperties>
+                <channelDensity id="Leak_all" ionChannel="Leak" condDensity="0.005 mS_per_cm2" erev="-50 mV" ion="non_specific"/>
+                <channelDensity id="k_slow_all" ionChannel="k_slow" condDensity="3 mS_per_cm2" erev="-60 mV" ion="k"/>
+                <channelDensity id="ca_boyle_all" ionChannel="ca_boyle" condDensity="3 mS_per_cm2" erev="40 mV" ion="ca"/>
+                <spikeThresh value="-20 mV"/>
+                <specificCapacitance value="1 uF_per_cm2"/>
+                <initMembPotential value="-45 mV"/>
+            </membraneProperties>
+            <intracellularProperties>
+                <species id="ca" concentrationModel="CaPool" ion="ca" initialConcentration="0 mM" initialExtConcentration="2E-6 mol_per_cm3"/>
+                <resistivity value="0.1 kohm_cm"/>
+            </intracellularProperties>
+        </biophysicalProperties>
+    </cell>
+
+    <pulseGenerator id="stim" delay="50 ms" duration="200 ms" amplitude="4 pA"/>
+
+    <network id="CalciumNet">
+        <population id="pop" component="CalciumCell" size="1" type="populationList">
+            <instance id="0"><location x="0" y="0" z="0"/></instance>
+        </population>
+        <inputList id="stimInput" component="stim" population="pop">
+            <input id="0" target="../pop/0/CalciumCell" destination="synapses"/>
+        </inputList>
+    </network>
+
+</neuroml>
