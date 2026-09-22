@@ -283,3 +283,35 @@ def test_unknown_segment_group_is_an_error():
     morphology = build_morphology(cell, ConversionReport())
     with pytest.raises(MorphologyError, match="Unknown segmentGroup"):
         morphology.compartments_of_group("nope")
+
+
+# --------------------------------------------------------------------------- #
+# Unresolved includes
+# --------------------------------------------------------------------------- #
+def test_missing_include_is_reported_and_explained(tmp_path):
+    """A LEMS file away from its siblings must say so, not look empty."""
+    import shutil
+
+    import tarjuman
+    from tarjuman.errors import ParseError
+
+    shutil.copy(DATA / "LEMS_hh_single_comp.xml", tmp_path)
+    with pytest.raises(ParseError) as failure:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tarjuman.run_lems(tmp_path / "LEMS_hh_single_comp.xml")
+
+    message = str(failure.value)
+    assert "hh_single_comp.nml" in message  # names the file it could not find
+    assert str(tmp_path) in message  # and where it looked
+
+
+def test_core_definition_includes_are_not_reported_as_missing():
+    """Cells.xml and friends are built in; their absence is not a problem."""
+    import tarjuman
+
+    report = ConversionReport()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tarjuman.read_lems(DATA / "LEMS_hh_single_comp.xml", report=report)
+    assert report.unresolved_includes == []
