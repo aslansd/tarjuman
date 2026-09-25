@@ -320,3 +320,92 @@ def test_converted_model_is_differentiable_in_its_channel_parameters():
     gradient = jax.grad(peak_voltage)(parameters)
     value = float(list(gradient[0].values())[0].ravel()[0])
     assert np.isfinite(value) and value != 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Synaptic delays and batched connection
+# --------------------------------------------------------------------------- #
+DELAYED_MODEL = DATA / "delayed_chemical.nml"
+
+
+def test_delayed_synapse_hands_over_the_voltage_n_steps_late():
+    from tarjuman.synapses import DelayedSynapse, ExpTwoSynapse
+
+    inner = ExpTwoSynapse(name="syn", gbase=1.0, tau_rise=0.5, tau_decay=5.0)
+    synapse = DelayedSynapse(inner, delay_steps=4, initial_voltage=-70.0)
+    params = dict(synapse.synapse_params)
+    states = dict(synapse.synapse_states)
+
+    responses = []
+    for step in range(8):
+        pre_v = 10.0 if step == 0 else -70.0  # one spike, at step 0
+        states.update(synapse.update_states(states, 0.025, pre_v, -70.0, params))
+        responses.append(float(states["syn_B"]))
+
+    # The wrapped synapse sees the spike only once it reaches the end of the
+    # register: nothing happens for the first four steps.
+    assert all(value == 0.0 for value in responses[:4])
+    assert responses[4] > 0.0
+
+
+def test_delay_is_built_when_the_time_step_is_known():
+    model = tarjuman.from_neuroml(DELAYED_MODEL, delta_t=0.025)
+    assert sorted(set(model.module.edges["type"])) == ["ampa_delay200"]  # 5 ms / 0.025
+    assert any("shift registers" in note.message for note in model.report.notes)
+
+
+def test_delay_is_dropped_when_the_time_step_is_unknown():
+    model = tarjuman.from_neuroml(DELAYED_MODEL)
+    assert sorted(set(model.module.edges["type"])) == ["ampa"]
+    assert any(
+        "dropped" in note.message and "delay" in note.message
+        for note in model.report.approximations
+    )
+
+
+def test_delay_shifts_the_postsynaptic_response_by_the_right_amount():
+    lags = {}
+    for delta_t in (None, 0.025):
+        model = tarjuman.from_neuroml(
+            DELAYED_MODEL, **({"delta_t": delta_t} if delta_t else {})
+        )
+        result = tarjuman.simulate(
+            model, t_max=120.0, delta_t=0.025, records=["pre[0]/v", "post[0]/v"]
+        )
+        pre = np.asarray(result["pre[0]/v"])
+        post = np.asarray(result["post[0]/v"])
+        spike = result.time[np.argmax(pre > 0.0)]
+        response = result.time[np.argmax(post > -64.9)]
+        lags[delta_t] = response - spike
+
+    assert lags[0.025] - lags[None] == pytest.approx(5.0, abs=0.05)
+
+
+def test_batched_connection_pairs_the_right_compartments():
+    """One `connect` per projection must give the same edges as one per connection."""
+    from tarjuman import read_neuroml_string
+    from tarjuman.builder import build
+
+    text = """
+    <neuroml id="doc">
+      <expOneSynapse id="syn" gbase="1nS" erev="0mV" tauDecay="2ms"/>
+      <cell id="c">
+        <morphology id="m">
+          <segment id="0"><proximal x="0" y="0" z="0" diameter="10"/>
+            <distal x="0" y="10" z="0" diameter="10"/></segment>
+        </morphology>
+      </cell>
+      <network id="net">
+        <population id="p" component="c" size="4"/>
+        <projection id="proj" presynapticPopulation="p" postsynapticPopulation="p" synapse="syn">
+          <connectionWD id="0" preCellId="../p[3]" postCellId="../p[0]" weight="2" delay="0ms"/>
+          <connectionWD id="1" preCellId="../p[0]" postCellId="../p[2]" weight="1" delay="0ms"/>
+          <connectionWD id="2" preCellId="../p[1]" postCellId="../p[3]" weight="7" delay="0ms"/>
+        </projection>
+      </network>
+    </neuroml>
+    """
+    model = build(read_neuroml_string(text), network_id="net")
+    edges = model.module.edges
+    assert list(zip(edges["pre_index"], edges["post_index"])) == [(3, 0), (0, 2), (1, 3)]
+    assert edges["syn_weight"].tolist() == [2.0, 1.0, 7.0]
