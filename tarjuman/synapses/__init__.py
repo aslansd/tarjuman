@@ -32,6 +32,7 @@ from .lems_synapse import LemsSynapse, make_lems_synapse
 
 __all__ = [
     "LemsSynapse",
+    "DelayedSynapse",
     "ExpTwoSynapse",
     "BlockingPlasticSynapse",
     "GapJunction",
@@ -369,6 +370,78 @@ class SilentSynapse(Synapse):
 
     def compute_current(self, states, pre_voltage, post_voltage, params):
         return 0.0 * post_voltage
+
+
+class DelayedSynapse(Synapse):
+    """Wraps any synapse so that it sees the presynaptic voltage ``n`` steps late.
+
+    NeuroML connections carry a ``delay``; Jaxley synapses see the presynaptic
+    voltage at the current step only.  The gap is closed with a shift register:
+    the wrapper keeps ``delay_steps`` extra states holding the recent history of
+    the presynaptic voltage, and hands the oldest of them to the synapse it
+    wraps.  Everything downstream — threshold detection for event-driven
+    synapses, the sigmoid of a graded one — is delayed with it, because it is
+    all computed from the voltage the wrapped synapse is given.
+
+    This follows the approach suggested by the Jaxley developers in
+    jaxleyverse/jaxley#810.  The delay is quantised to whole time steps, so it
+    is exact only when ``delay`` is a multiple of ``delta_t``.
+
+    Args:
+        synapse: The synapse to wrap. Its name is reused, so its parameters and
+            states keep their names.
+        delay_steps: Number of integration steps of delay (at least 1).
+        initial_voltage: Value the register is filled with at t = 0, in mV.
+    """
+
+    def __init__(
+        self,
+        synapse: Synapse,
+        delay_steps: int,
+        initial_voltage: float = -70.0,
+    ):
+        super().__init__(synapse.name)
+        if delay_steps < 1:
+            raise ValueError("delay_steps must be at least 1.")
+        self.inner = synapse
+        self.delay_steps = int(delay_steps)
+
+        prefix = self._name
+        self.synapse_params = dict(synapse.synapse_params)
+        self.synapse_states = dict(synapse.synapse_states)
+        for step in range(self.delay_steps):
+            self.synapse_states[f"{prefix}_delay_{step}"] = float(initial_voltage)
+
+    @property
+    def _oldest(self) -> str:
+        return f"{self._name}_delay_{self.delay_steps - 1}"
+
+    def _shift(self, states, pre_voltage) -> dict:
+        """Advance the shift register by one step."""
+        prefix = self._name
+        shifted = {
+            f"{prefix}_delay_{step}": states[f"{prefix}_delay_{step - 1}"]
+            for step in range(self.delay_steps - 1, 0, -1)
+        }
+        shifted[f"{prefix}_delay_0"] = pre_voltage
+        return shifted
+
+    def update_states(self, states, delta_t, pre_voltage, post_voltage, params):
+        delayed = states[self._oldest]
+        updated = dict(
+            self.inner.update_states(states, delta_t, delayed, post_voltage, params)
+        )
+        updated.update(self._shift(states, pre_voltage))
+        return updated
+
+    def compute_current(self, states, pre_voltage, post_voltage, params):
+        return self.inner.compute_current(
+            states, states[self._oldest], post_voltage, params
+        )
+
+    def init_state(self, states, v, params, delta_t):
+        initialiser = getattr(self.inner, "init_state", None)
+        return initialiser(states, v, params, delta_t) if initialiser else {}
 
 
 #: NeuroML component types with a Jaxley equivalent.
