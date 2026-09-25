@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+Acts on the Jaxley developers' answers in
+[jaxleyverse/jaxley#810](https://github.com/jaxleyverse/jaxley/issues/810).
+
+### Synaptic delays are now implemented
+
+NeuroML connection `delay`s used to be dropped. They are now built as shift
+registers over the presynaptic voltage, following the approach Jonas Beck
+suggested upstream: `DelayedSynapse` wraps any synapse and hands it the
+voltage from `delay_steps` integration steps ago, so threshold detection and
+graded transmission are delayed with it.
+
+Delays are quantised to whole steps, so the step has to be known when the model
+is built: `run_lems()` takes it from the LEMS file, and `from_neuroml()` accepts
+`delta_t`. Without it the delay is still dropped, and the report now says why
+and how to fix it.
+
+### Connections are made in batches
+
+`connect()` accepts views of many compartments and pairs them element-wise, so
+a whole projection is now one call instead of one per connection. Measured on a
+synthetic network, 1000 synapses went from 21.7 s to 0.45 s — a 48x speedup,
+and the gap widens with size, since the one-by-one path is quadratic.
+Converting c302's full connectome (397 cells, 4999 synapses) now takes about
+13 s.
+
+Connections are grouped by synapse component and delay; per-connection weights
+are applied in groups too.
+
+### Other
+
+- The `pumped_ions` workaround is annotated with jaxleyverse/jaxley#811, where
+  it is confirmed as a bug; it becomes a no-op once the fix lands.
+
 ## 0.2.1 — unreleased
 
 - Unresolved `<include>` / `<Include>` elements are now reported instead of

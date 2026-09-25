@@ -155,7 +155,7 @@ back on the way out, using the dimensions the `ComponentType` declares.
 | `pulseGenerator`, `rampGenerator`, `sineGenerator`, `inputList`, `explicitInput` | ✅ |
 | LEMS `Simulation`, `OutputFile`, `Display` | ✅ |
 | `channelDensityNernst` | ⚠️ needs an explicit `erev` (`erev_overrides`) |
-| Synaptic `delay` | ⚠️ dropped — Jaxley has no delay line |
+| Synaptic `delay` | ✅ shift register; needs `delta_t` at build time |
 | `tsodyksMarkram` short-term plasticity | ⚠️ ignored, synapse converted without it |
 | `ionChannelKS`, `gateKS`, `gateFractional` | ❌ not yet |
 | `channelDensityGHK` | ❌ not yet |
@@ -191,7 +191,13 @@ cell type cannot be interpreted as written. This is what blocks c302 parameter
 set B. Parsing does not fail — only instantiating that component does, with an
 explanation.
 
-**Synaptic delays** have no representation in Jaxley at all.
+**Synaptic delays** are quantised to whole integration steps. A NeuroML
+connection `delay` becomes a shift register over the presynaptic voltage
+(`DelayedSynapse`), which costs `delay / delta_t` extra states per synapse — a
+5 ms delay at `delta_t = 0.025 ms` is 200 of them. Because the register length
+is fixed when the model is built, the step must be known then: `run_lems()`
+takes it from the LEMS file, `from_neuroml()` accepts `delta_t=`. Without it
+the delay is dropped and the report says so.
 
 ## Correctness
 
@@ -214,7 +220,7 @@ The package is checked against things that do not depend on it:
   targeting, and `(segment, fractionAlong)` → `(branch, compartment)` mapping.
 
 ```bash
-pytest          # 90 tests
+pytest          # 95 tests
 ```
 
 ## Design notes
@@ -250,16 +256,21 @@ for one. Any remaining collision raises rather than silently overwriting.
 Two things belong in Jaxley rather than here, and `tarjuman` works around both:
 
 1. `jx.Network(cells)` collects the pumps of its cells but not the list of ion
-   concentrations they modify, so the integrator does not solve for them.
-2. `connect()` appends one row per edge, which is slow for connectome-scale
-   networks (c302's full model has ~5000 synapses).
+   concentrations they modify, so the integrator does not solve for them —
+   confirmed as a bug in
+   [jaxleyverse/jaxley#811](https://github.com/jaxleyverse/jaxley/issues/811)
+   and being fixed; tarjuman restores the list meanwhile.
+2. ~~`connect()` appends one row per edge~~ — resolved: `connect()` accepts
+   views of many compartments and pairs them element-wise, which tarjuman now
+   uses (48x faster at 1000 synapses).
 
 ## Roadmap
 
 1. Kinetic-scheme channels (`ionChannelKS`).
 2. Spike sources (`spikeArray`, `spikeGeneratorPoisson`) as presynaptic drivers.
-3. The remaining point cells (`izhikevich2007Cell`, `adExIaFCell`), which need
-   the same reset treatment plus their own recovery variables.
+3. The remaining point cells (`izhikevich2007Cell`, `adExIaFCell`). Jaxley has
+   integrate-and-fire mechanisms on the way for its 1.0 release, which should
+   replace tarjuman's conductance-clamp approximation entirely.
 4. `channelDensityNernst` computed from the pool, and `channelDensityGHK`.
 5. A CI job comparing traces against `pynml`/`jnml` across the NeuroML example
    suite and the c302 parameter sets.
