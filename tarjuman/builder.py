@@ -33,7 +33,7 @@ from .errors import ParseError
 from .morphology import CellMorphology, build_morphology
 from .pumps import ion_current_name, make_concentration_model
 from .report import ConversionReport
-from .synapses import DEFAULT_SPIKE_THRESHOLD, make_synapse
+from .synapses import DEFAULT_SPIKE_THRESHOLD, DelayedSynapse, make_synapse
 
 __all__ = ["ConvertedModel", "Stimulus", "build_cell", "build_network", "build"]
 
@@ -66,6 +66,17 @@ class ConvertedModel:
     cell_types: list[str] = field(default_factory=list)
     stimuli: list[Stimulus] = field(default_factory=list)
     temperature: float = DEFAULT_TEMPERATURE
+    #: Integration step in ms, when it is known at build time.  Synaptic delays
+    #: are quantised to whole steps, so they can only be built into the model
+    #: once the step is fixed; a LEMS file supplies it, a bare ``.nml`` file
+    #: does not unless the caller passes ``delta_t``.
+    delta_t: Optional[float] = None
+
+    def delay_steps(self, delay: float) -> int:
+        """Whole integration steps corresponding to a delay in ms."""
+        if not delay or self.delta_t is None or self.delta_t <= 0:
+            return 0
+        return int(round(delay / self.delta_t))
 
     # -- addressing ------------------------------------------------------- #
     def locate(
@@ -395,6 +406,7 @@ def build_network(
     max_comp_length: Optional[float] = None,
     temperature: Optional[float] = None,
     erev_overrides: Optional[dict[str, float]] = None,
+    delta_t: Optional[float] = None,
 ) -> ConvertedModel:
     """Build a Jaxley network from a NeuroML ``network``.
 
@@ -407,6 +419,8 @@ def build_network(
         temperature: Temperature in K; defaults to the network's own
             ``temperature`` attribute, or 6.3 degC if it has none.
         erev_overrides: Reversal potentials keyed by ``channelDensity`` id.
+        delta_t: Integration step in ms. Needed to build synaptic delays, which
+            are quantised to whole steps; without it they are dropped.
 
     Returns:
         A :class:`ConvertedModel` wrapping a :class:`jaxley.Network`.
@@ -510,6 +524,7 @@ def build_network(
         cell_index=cell_index,
         cell_types=cell_types,
         temperature=temperature,
+        delta_t=delta_t,
     )
 
     _connect_projections(model, network_ir, document, report)
@@ -528,8 +543,9 @@ def _reregister_pumped_ions(net) -> None:
 
     Jaxley collects the pumps of the cells a ``Network`` is built from, but not
     the list of ion concentrations those pumps modify, so the integrator does
-    not know it has to solve for them. Until that is fixed upstream, tarjuman
-    restores the list here.
+    not know it has to solve for them (jaxleyverse/jaxley#811, confirmed as a
+    bug and being fixed). This restores the list, and becomes a no-op once the
+    upstream fix is in.
     """
     for pump in net.base.pumps:
         ion_name = getattr(pump, "ion_name", None)
@@ -571,16 +587,24 @@ def _synapse_for(
     document: ir.Document,
     component_id: Optional[str],
     threshold: float,
-    cache: dict[str, object],
+    cache: dict,
     report: ConversionReport,
     context: str,
+    delay_steps: int = 0,
+    initial_voltage: float = -70.0,
 ):
-    """Return (and cache) the Jaxley synapse for a NeuroML synapse component."""
+    """Return (and cache) the Jaxley synapse for a NeuroML synapse component.
+
+    A connection with a delay gets its own synapse type, because the length of
+    the shift register is part of the type rather than a parameter.
+    """
     if component_id is None:
         report.unsupported(context, "the connection names no synapse component")
         return None
-    if component_id in cache:
-        return cache[component_id]
+    key = (component_id, delay_steps)
+    if key in cache:
+        return cache[key]
+    name = component_id if delay_steps == 0 else f"{component_id}_delay{delay_steps}"
     synapse_ir = document.synapses.get(component_id)
     if synapse_ir is None:
         report.unsupported(
@@ -590,14 +614,16 @@ def _synapse_for(
     try:
         synapse = make_synapse(
             synapse_ir,
-            name=component_id,
+            name=name,
             threshold=threshold,
             component_types=document.component_types,
         )
+        if delay_steps > 0:
+            synapse = DelayedSynapse(synapse, delay_steps, initial_voltage)
     except Exception as error:
         report.unsupported(context, str(error))
         return None
-    cache[component_id] = synapse
+    cache[key] = synapse
     return synapse
 
 
@@ -614,9 +640,45 @@ def _connect_projections(
     one-directional, so each gap junction becomes a pair.  In a
     ``continuousProjection`` each side has its own component, and a
     ``silentSynapse`` side contributes no current and is skipped.
+
+    Connections are grouped by synapse component and made in one ``connect``
+    call each: ``connect`` pairs two equal-length views element-wise, so a
+    whole projection costs one call rather than one per connection.  On c302's
+    full connectome that is the difference between minutes and seconds.
     """
     net = model.module
-    cache: dict[str, object] = {}
+    cache: dict = {}
+    # (component id, delay steps) -> (pre comps, post comps, weights)
+    grouped: dict[tuple, tuple[list[int], list[int], list[float]]] = {}
+    index_of = _compartment_index_map(net)
+    resting = _resting_potential(net)
+
+    def add(
+        component: Optional[str],
+        source,
+        target,
+        weight: float,
+        context: str,
+        delay_steps: int = 0,
+    ):
+        synapse = _synapse_for(
+            document,
+            component,
+            threshold,
+            cache,
+            report,
+            context,
+            delay_steps,
+            resting,
+        )
+        if synapse is None:
+            return
+        pre_comps, post_comps, weights = grouped.setdefault(
+            (component, delay_steps), ([], [], [])
+        )
+        pre_comps.append(index_of[source])
+        post_comps.append(index_of[target])
+        weights.append(weight)
 
     for projection in network_ir.projections:
         pre_population = next(
@@ -628,20 +690,19 @@ def _connect_projections(
         )
         context = f"{projection.kind} '{projection.id}'"
 
-        if any(connection.delay > 0 for connection in projection.connections):
-            report.approximation(
-                context, "synaptic delays are dropped; Jaxley has no delay line"
-            )
+        delays = [connection.delay for connection in projection.connections]
+        if any(delay > 0 for delay in delays):
+            _report_delays(model, report, context, delays)
 
         for connection in projection.connections:
             try:
-                pre = model.view(
+                source = model.locate(
                     projection.pre_population,
                     connection.pre_cell,
                     connection.pre_segment,
                     connection.pre_fraction_along,
                 )
-                post = model.view(
+                target = model.locate(
                     projection.post_population,
                     connection.post_cell,
                     connection.post_segment,
@@ -651,46 +712,115 @@ def _connect_projections(
                 report.unsupported(context, str(error))
                 continue
 
+            delay_steps = model.delay_steps(connection.delay)
             if projection.kind == "projection":
-                pairs = [
-                    (
-                        connection.synapse or projection.synapse,
-                        pre,
-                        post,
-                        connection.weight,
-                    )
-                ]
+                add(
+                    connection.synapse or projection.synapse,
+                    source,
+                    target,
+                    connection.weight,
+                    context,
+                    delay_steps,
+                )
             elif projection.kind == "electricalProjection":
-                component = connection.synapse or projection.synapse
                 # A NeuroML gap junction passes current both ways.
-                pairs = [
-                    (component, pre, post, connection.weight),
-                    (component, post, pre, connection.weight),
-                ]
+                component = connection.synapse or projection.synapse
+                add(component, source, target, connection.weight, context, delay_steps)
+                add(component, target, source, connection.weight, context, delay_steps)
             else:  # continuousProjection
-                pairs = []
                 if _is_active(document, connection.post_component):
-                    pairs.append(
-                        (connection.post_component, pre, post, connection.weight)
+                    add(
+                        connection.post_component,
+                        source,
+                        target,
+                        connection.weight,
+                        context,
+                        delay_steps,
                     )
                 if _is_active(document, connection.pre_component):
-                    pairs.append(
-                        (connection.pre_component, post, pre, connection.weight)
+                    add(
+                        connection.pre_component,
+                        target,
+                        source,
+                        connection.weight,
+                        context,
+                        delay_steps,
                     )
 
-            for component, source, target, weight in pairs:
-                synapse = _synapse_for(
-                    document, component, threshold, cache, report, context
-                )
-                if synapse is None:
-                    continue
-                edge_index = int(net.edges.shape[0])
-                connect(source, target, synapse)
-                if weight != 1.0:
-                    # NeuroML puts the weight on the connection, Jaxley on the edge.
-                    net.select(edges=[edge_index]).set(
-                        f"{synapse.name}_weight", weight
-                    )
+    for key, (pre_comps, post_comps, weights) in grouped.items():
+        synapse = cache[key]
+        first_edge = int(net.edges.shape[0])
+        connect(
+            net.select(nodes=pre_comps), net.select(nodes=post_comps), synapse
+        )
+        # NeuroML puts the weight on the connection, Jaxley on the edge.  Edges
+        # that share a weight are set together, again to keep this off the
+        # per-connection path.
+        by_weight: dict[float, list[int]] = {}
+        for offset, weight in enumerate(weights):
+            if weight != 1.0:
+                by_weight.setdefault(weight, []).append(first_edge + offset)
+        for weight, edges in by_weight.items():
+            net.select(edges=edges).set(f"{synapse.name}_weight", weight)
+
+
+def _report_delays(
+    model: ConvertedModel,
+    report: ConversionReport,
+    context: str,
+    delays: list[float],
+) -> None:
+    """Say what happened to a projection's synaptic delays."""
+    delayed = [delay for delay in delays if delay > 0]
+    if model.delta_t is None:
+        report.approximation(
+            context,
+            f"{len(delayed)} connections carry a synaptic delay, which is dropped: "
+            "delays are quantised to whole integration steps, so the step has to "
+            "be known when the model is built. Pass delta_t to from_neuroml(), or "
+            "use run_lems(), which takes it from the LEMS file",
+        )
+        return
+    steps = {model.delay_steps(delay) for delay in delayed}
+    if steps == {0}:
+        report.approximation(
+            context,
+            f"synaptic delays are shorter than one integration step "
+            f"({model.delta_t:g} ms) and are dropped",
+        )
+        return
+    report.info(
+        context,
+        f"{len(delayed)} synaptic delays implemented as shift registers of "
+        f"{sorted(steps)} steps at delta_t = {model.delta_t:g} ms",
+    )
+
+
+def _resting_potential(net) -> float:
+    """A sensible value to prefill a delay register with."""
+    try:
+        return float(net.nodes["v"].median())
+    except Exception:  # pragma: no cover - defensive
+        return -70.0
+
+
+def _compartment_index_map(net) -> dict[tuple[int, int, int], int]:
+    """``(cell, branch, comp)`` -> global compartment index, built once."""
+    nodes = net.nodes
+    cells = (
+        nodes["global_cell_index"]
+        if "global_cell_index" in nodes.columns
+        else nodes["local_cell_index"]
+    )
+    return {
+        (int(cell), int(branch), int(comp)): int(index)
+        for index, cell, branch, comp in zip(
+            nodes.index,
+            cells,
+            nodes["local_branch_index"],
+            nodes["local_comp_index"],
+        )
+    }
 
 
 def _is_active(document: ir.Document, component_id: Optional[str]) -> bool:
@@ -797,9 +927,11 @@ def build(
                 )
             cell_id = next(iter(document.cells))
         temperature = kwargs.pop("temperature", None) or DEFAULT_TEMPERATURE
+        delta_t = kwargs.pop("delta_t", None)
         cell, morphology = build_cell(
             document, cell_id, report=report, temperature=temperature, **kwargs
         )
+        kwargs["delta_t"] = delta_t
         report.n_cells = 1
         report.n_branches = len(morphology.branches)
         report.n_compartments = morphology.n_compartments
@@ -810,5 +942,6 @@ def build(
             morphologies={cell_id: morphology},
             cell_types=[cell_id],
             temperature=temperature,
+            delta_t=kwargs.get("delta_t"),
         )
     return build_network(document, network_id=network_id, report=report, **kwargs)

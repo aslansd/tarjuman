@@ -86,7 +86,8 @@ def from_neuroml(
         cell_id: Build this cell alone instead of a network.
         strict: Raise instead of warning when something cannot be converted.
         **kwargs: Passed to the builder (``ncomp``, ``max_comp_length``,
-            ``temperature``, ``erev_overrides``).
+            ``temperature``, ``erev_overrides``, ``delta_t``). Pass ``delta_t``
+            to build synaptic delays, which are quantised to whole steps.
 
     Returns:
         A :class:`~tarjuman.builder.ConvertedModel`; ``model.module`` is the
@@ -194,11 +195,13 @@ def run_lems(
 
     network_id = simulation.target if simulation.target in document.networks else None
     cell_id = simulation.target if simulation.target in document.cells else None
+    step = delta_t if delta_t is not None else simulation.step
     model = build(
         document,
         network_id=network_id,
         cell_id=cell_id,
         report=report,
+        delta_t=kwargs.pop("delta_t", step),
         **kwargs,
     )
 
