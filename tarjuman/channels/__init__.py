@@ -103,6 +103,10 @@ class _GateSpec:
     custom_params: dict[str, tuple[str, float]] = field(default_factory=dict)
     part_params: dict[str, dict[str, tuple[str, float]]] = field(default_factory=dict)
     needs_calcium: bool = False
+    #: Independent kinetic states whose weighted sum is this gate's q.
+    sub_gates: list["_GateSpec"] = field(default_factory=list)
+    #: Jaxley parameter holding this subgate's dimensionless weight.
+    fractional_conductance_param: Optional[str] = None
 
 
 class NeuroMLChannel(Channel):
@@ -160,6 +164,10 @@ class NeuroMLChannel(Channel):
         self._gates: list[_GateSpec] = [
             self._build_gate(gate, prefix) for gate in channel.gates
         ]
+        # Fractional parents expose a weighted sum, not a single kinetic state.
+        self._kinetic_gates: list[_GateSpec] = [
+            child for gate in self._gates for child in (gate.sub_gates or [gate])
+        ]
         #: Calcium-dependent gates read the pool's concentration.  Declaring
         #: the state here is how a Jaxley channel asks to be given it; it is
         #: never written back, the pump owns it.
@@ -175,7 +183,13 @@ class NeuroMLChannel(Channel):
             self.channel_states[CALCIUM_STATE] = float(initial_calcium)
 
     # -- construction ----------------------------------------------------- #
-    def _build_gate(self, gate: ir.Gate, prefix: str) -> _GateSpec:
+    def _build_gate(
+        self,
+        gate: ir.Gate,
+        prefix: str,
+        *,
+        inherited_rate_scale: Optional[str] = None,
+    ) -> _GateSpec:
         base = f"{prefix}_{gate.id}"
         spec = _GateSpec(
             id=gate.id,
@@ -187,6 +201,17 @@ class NeuroMLChannel(Channel):
 
         if gate.custom is not None:
             return self._build_custom_gate(gate, spec, base)
+        if inherited_rate_scale is None:
+            rate_scale = (
+                gate.q10.factor(self.temperature) if gate.q10 is not None else 1.0
+            )
+            spec.rate_scale_param = f"{base}_rateScale"
+            self.channel_params[spec.rate_scale_param] = float(rate_scale)
+        else:
+            spec.rate_scale_param = inherited_rate_scale
+
+        if gate.kind == "gateFractional":
+            return self._build_fractional_gate(gate, spec, base)
         for part, component in gate.custom_parts.items():
             dynamics, parameters, needs_calcium = self._compile_custom(
                 component, f"{base}_{part}"
@@ -212,14 +237,35 @@ class NeuroMLChannel(Channel):
             spec.tau_param = f"{base}_tau"
             self.channel_params[spec.tau_param] = float(gate.time_course.tau)
 
-        rate_scale = gate.q10.factor(self.temperature) if gate.q10 is not None else 1.0
-        spec.rate_scale_param = f"{base}_rateScale"
-        self.channel_params[spec.rate_scale_param] = float(rate_scale)
-
         if not spec.is_instantaneous:
             self.channel_states[spec.state_name] = 0.0
 
         self._validate_gate(spec)
+        return spec
+
+    def _build_fractional_gate(
+        self, gate: ir.Gate, spec: _GateSpec, base: str
+    ) -> _GateSpec:
+        """Build subgates that inherit the parent's Q10 rate scale once."""
+        if not gate.sub_gates or any(
+            child.kind != "subGate" for child in gate.sub_gates
+        ):
+            raise UnsupportedComponentError(
+                f"Fractional gate '{gate.id}' requires subGate children."
+            )
+        for child in gate.sub_gates:
+            if child.fractional_conductance is None:
+                raise UnsupportedComponentError(
+                    f"Subgate '{child.id}' is missing fractionalConductance."
+                )
+            child_spec = self._build_gate(
+                child, base, inherited_rate_scale=spec.rate_scale_param
+            )
+            weight = f"{child_spec.state_name}_fractionalConductance"
+            self.channel_params[weight] = float(child.fractional_conductance)
+            child_spec.fractional_conductance_param = weight
+            spec.sub_gates.append(child_spec)
+        spec.needs_calcium = any(child.needs_calcium for child in spec.sub_gates)
         return spec
 
     def _compile_custom(
@@ -335,6 +381,7 @@ class NeuroMLChannel(Channel):
                 "reverseRate."
             )
         needs_steady_state = spec.kind in (
+            "subGate",
             "gateHHtauInf",
             "gateHHratesInf",
             "gateHHratesTauInf",
@@ -344,7 +391,12 @@ class NeuroMLChannel(Channel):
             raise UnsupportedComponentError(
                 f"Gate '{spec.id}' of type {spec.kind} is missing steadyState."
             )
-        needs_tau = spec.kind in ("gateHHtauInf", "gateHHratesTau", "gateHHratesTauInf")
+        needs_tau = spec.kind in (
+            "gateHHtauInf",
+            "gateHHratesTau",
+            "gateHHratesTauInf",
+            "subGate",
+        )
         if needs_tau and not has("time_course", spec.tau_param):
             raise UnsupportedComponentError(
                 f"Gate '{spec.id}' of type {spec.kind} is missing timeCourse."
@@ -369,24 +421,55 @@ class NeuroMLChannel(Channel):
         if spec.alpha is not None:
             alpha = spec.alpha(v, *(params[name] for name in spec.alpha_params))
         elif "forward_rate" in spec.part_dynamics:
-            alpha = self._part_exposure(spec, "forward_rate", "r", "per_time", v, states, params)
+            alpha = self._part_exposure(
+                spec, "forward_rate", "r", "per_time", v, states, params
+            )
         if spec.beta is not None:
             beta = spec.beta(v, *(params[name] for name in spec.beta_params))
         elif "reverse_rate" in spec.part_dynamics:
-            beta = self._part_exposure(spec, "reverse_rate", "r", "per_time", v, states, params)
+            beta = self._part_exposure(
+                spec, "reverse_rate", "r", "per_time", v, states, params
+            )
+
+        # LEMS child requirements use coherent SI units, while the native
+        # rate functions above return Jaxley units (1/ms). Pass unscaled rates;
+        # Q10 is applied once to the resulting gate time constant below.
+        parent_requirements = {
+            name: to_si(value, "per_time")
+            for name, value in (("alpha", alpha), ("beta", beta))
+            if value is not None
+        }
 
         if spec.steady_state is not None:
             inf = spec.steady_state(
                 v, *(params[name] for name in spec.steady_state_params)
             )
         elif "steady_state" in spec.part_dynamics:
-            inf = self._part_exposure(spec, "steady_state", "x", "none", v, states, params)
+            inf = self._part_exposure(
+                spec,
+                "steady_state",
+                "x",
+                "none",
+                v,
+                states,
+                params,
+                parent_requirements=parent_requirements,
+            )
         else:
             inf = alpha / (alpha + beta)
 
         if "time_course" in spec.part_dynamics:
             tau = (
-                self._part_exposure(spec, "time_course", "t", "time", v, states, params)
+                self._part_exposure(
+                    spec,
+                    "time_course",
+                    "t",
+                    "time",
+                    v,
+                    states,
+                    params,
+                    parent_requirements=parent_requirements,
+                )
                 / rate_scale
             )
         elif spec.kind in _TAU_FROM_ALPHA_BETA:
@@ -406,10 +489,19 @@ class NeuroMLChannel(Channel):
         v: ArrayLike,
         states: dict,
         params: dict[str, Array],
-    ):
+        *,
+        parent_requirements: Optional[dict[str, ArrayLike]] = None,
+    ) -> ArrayLike:
         """Evaluate a custom rate/variable/timeCourse inside a standard gate."""
         dynamics = spec.part_dynamics[part]
         context = self._custom_context(spec.part_params[part], v, states, params)
+        context.update(
+            {
+                name: value
+                for name, value in (parent_requirements or {}).items()
+                if name in dynamics.component.requirements
+            }
+        )
         values = dynamics.evaluate({}, context)
         name = exposure if exposure in values else _sole_exposure(dynamics, exposure)
         return from_si(values[name], dimension)
@@ -459,7 +551,7 @@ class NeuroMLChannel(Channel):
     ) -> dict[str, Array]:
         """Advance every dynamic gate by ``dt`` with exponential Euler."""
         updated: dict[str, Array] = {}
-        for spec in self._gates:
+        for spec in self._kinetic_gates:
             if spec.is_instantaneous:
                 continue
             inf, tau = self._inf_and_tau(spec, v, params, states)
@@ -471,20 +563,50 @@ class NeuroMLChannel(Channel):
             updated[spec.state_name] = jnp.where(tau > _MIN_TAU, stepped, inf)
         return updated
 
+    def _gate_value(
+        self,
+        spec: _GateSpec,
+        states: dict[str, Array],
+        v: ArrayLike,
+        params: dict[str, Array],
+    ) -> ArrayLike:
+        """Gate q, including the weighted subgate sum of a fractional gate."""
+        if spec.sub_gates:
+            return sum(
+                params[child.fractional_conductance_param]
+                * self._gate_value(child, states, v, params)
+                for child in spec.sub_gates
+            )
+        if spec.is_instantaneous:
+            return self._inf_and_tau(spec, v, params, states)[0]
+        return states[spec.state_name]
+
+    def _gate_product(
+        self,
+        states: dict[str, Array],
+        v: ArrayLike,
+        params: dict[str, Array],
+    ) -> Array:
+        """Product of the gates' conductance contributions."""
+        open_fraction = jnp.array(1.0)
+        for spec in self._gates:
+            q = self._gate_value(spec, states, v, params)
+            open_fraction = open_fraction * self._open_fraction(
+                spec, q, v, params, states
+            )
+        return open_fraction
+
+    def compute_open_fraction(
+        self, states: dict[str, Array], v: ArrayLike, params: dict[str, Array]
+    ) -> Array:
+        """LEMS ``fopen`` at the supplied state, including conductance scaling."""
+        return self._conductance_scaling * self._gate_product(states, v, params)
+
     def compute_current(
         self, states: dict[str, Array], v: float, params: dict[str, Array]
     ) -> Array:
         """Current density in mA/cm2 (``gbar * prod(q^instances) * (v - e)``)."""
-        open_fraction = jnp.array(1.0)
-        for spec in self._gates:
-            if spec.is_instantaneous:
-                q, _ = self._inf_and_tau(spec, v, params, states)
-            else:
-                q = states[spec.state_name]
-            open_fraction = open_fraction * self._open_fraction(
-                spec, q, v, params, states
-            )
-
+        open_fraction = self._gate_product(states, v, params)
         conductance = (
             params[f"{self._name}_gbar"] * open_fraction * self._conductance_scaling
         )
@@ -499,7 +621,7 @@ class NeuroMLChannel(Channel):
     ) -> dict[str, ArrayLike]:
         """Initialise each gate at its steady state, as NeuroML's ``OnStart`` does."""
         initial: dict[str, ArrayLike] = {}
-        for spec in self._gates:
+        for spec in self._kinetic_gates:
             if spec.is_instantaneous:
                 continue
             inf, _ = self._inf_and_tau(spec, v, params, states)

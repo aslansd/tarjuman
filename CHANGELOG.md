@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+Most of this release is the work of **Hengye Zhu** (@HengyeZhu), a NeuroML
+editor, who validated tarjuman against the NeuroML reference tooling, found
+several real bugs, and fixed them. Their commit is merged here essentially as
+written; the validation harness they wrote lives in `tests/neuroml/`.
+
+### Validation (Hengye Zhu)
+
+A two-level approach, which is the right one given that Jaxley, jnml and
+jnml-neuron differ in numerical integration and update ordering:
+
+- **channels** against jnml, via LEMS tests generated with NeuroML's
+  `NML2ChannelAnalysis`;
+- **cells and networks** against independently handwritten Jaxley models built
+  from the original NeuroML files, which isolates *translation* correctness
+  from integrator differences.
+
+| examples | passed | max absolute voltage error | spike timing deviation |
+| --- | ---: | ---: | ---: |
+| Ex5, Ex10, Ex15, Ex20a, Ex24, Ex25 | 6/6 | 1.092e-9 mV | 0 ms |
+| c302 C Oscillator | 1/1 | 2.548e-12 mV | 0 ms |
+
+Run with `python tests/neuroml/run.py`. The harness pins the upstream model
+commits, records their licences, and enables float64 — which is what makes
+agreement at 1e-9 mV meaningful rather than a float32 artefact.
+
+### Fixed (Hengye Zhu)
+
+- **Fractional conductance gates.** `gateFractional` and its `subGate`
+  children were not implemented: subgate kinetics, their weighted combination,
+  the Q10 scale inherited from the parent gate, and `fopen` recording. This is
+  `Ex24`.
+- **Parent-gate requirements.** A custom `timeCourse` or `steadyState` may
+  declare `alpha`/`beta` as LEMS requirements and read them from its parent
+  gate. Those were never supplied, so any such channel failed to convert. With
+  the unit conversion for custom time constants, this is `Ex15`.
+- **Calcium-pool constants.** `NeuroMLConcentrationModel.compute_current`
+  rebuilt its evaluation context by hand and left out the ComponentType's
+  constants, so `decayingPoolConcentrationModel` — which needs `Faraday`,
+  `AREA_SCALE` and `LENGTH_SCALE` — raised `ParseError` on every call. Any
+  shell-based calcium pool was unusable.
+- **Recording rows.** Jaxley deduplicates recordings, so two LEMS output
+  columns that resolve to the same compartment and state share one row.
+  Mapping traces by position therefore misassigned them. Output paths are now
+  resolved against the model structure, and `iDensity`/`gDensity` are
+  recordable with the right unit scaling and sign.
+- **Synaptic threshold boundaries.** Spike detection now latches while the
+  presynaptic voltage is above threshold and rearms only once it falls back
+  below, with NeuroML's strictly-greater comparison. The previous rule
+  compared against the previous sample, which is not what
+  `OnCondition test="v .gt. thresh"` means.
+
+### Integrate-and-fire reset is now exact
+
+Earlier releases approximated NeuroML's reset with a large conductance towards
+the reset potential, on the stated premise that Jaxley has no state-assignment
+mechanism. That premise was wrong, as @HengyeZhu pointed out: a non-capacitive
+channel may return `"v"` from `update_states` and Jaxley takes it, which is how
+Jaxley's own `Leak` + `Fire` pair works.
+
+The reset is therefore a state assignment now, exactly as NeuroML specifies.
+The measured inter-spike interval moves from 0.1% to **0.027%** of the analytic
+value, the voltage lands exactly on the reset potential instead of converging
+towards it, and the conversion no longer reports an approximation. The
+refractory period is handled in the same channel, which is why this is not
+simply `Leak` + `Fire`: `Fire` has no notion of one.
+
+The gradient through a spike is zero, since a reset writes the voltage and a
+threshold crossing is a step. Sub-threshold parameters remain differentiable.
+Jaxley's `Fire` carries the same caveat for the same reason.
+
 ## 0.4.2 — unreleased
 
 - Every path in the README and the examples is now a real file, either bundled

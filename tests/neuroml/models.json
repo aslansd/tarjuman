@@ -1,0 +1,40 @@
+{
+  "NeuroML2": {
+    "repository": "NeuroML/NeuroML2",
+    "commit": "a5f5dadccd23606e683eaa0dd58dd2c3b2a7ed58",
+    "license": "LGPL-3.0",
+    "license_file": "LICENSE.lesser",
+    "files": [
+      "LEMSexamples/LEMS_NML2_Ex10_Q10.xml",
+      "LEMSexamples/LEMS_NML2_Ex15_CaDynamics.xml",
+      "LEMSexamples/LEMS_NML2_Ex20a_AnalogSynapsesHH.xml",
+      "LEMSexamples/LEMS_NML2_Ex24_FractionalConductance.xml",
+      "LEMSexamples/LEMS_NML2_Ex25_MultiComp.xml",
+      "LEMSexamples/LEMS_NML2_Ex5_DetCell.xml",
+      "LICENSE.lesser",
+      "NeuroML2CoreTypes/Cells.xml",
+      "NeuroML2CoreTypes/Channels.xml",
+      "NeuroML2CoreTypes/Inputs.xml",
+      "NeuroML2CoreTypes/Networks.xml",
+      "NeuroML2CoreTypes/NeuroMLCoreCompTypes.xml",
+      "NeuroML2CoreTypes/NeuroMLCoreDimensions.xml",
+      "NeuroML2CoreTypes/Simulation.xml",
+      "NeuroML2CoreTypes/Synapses.xml",
+      "examples/NML2_AnalogSynapsesHH.nml",
+      "examples/NML2_MultiCompCellNetwork.nml",
+      "examples/NML2_SingleCompHHCell.nml"
+    ]
+  },
+  "c302": {
+    "repository": "openworm/c302",
+    "commit": "6cd861f8ca4d3241ee9cf4627884caa930dab53c",
+    "license": "MIT",
+    "license_file": "LICENSE",
+    "files": [
+      "LICENSE",
+      "examples/LEMS_c302_C_Oscillator.xml",
+      "examples/c302_C_Oscillator.net.nml",
+      "examples/cell_C.xml"
+    ]
+  }
+}

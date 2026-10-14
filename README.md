@@ -150,7 +150,7 @@ back on the way out, using the dimensions the `ComponentType` declares.
 | `expOneSynapse`, `expTwoSynapse`, `alphaSynapse`, NMDA Mg block | ✅ |
 | `gapJunction`, `linearGradedSynapse`, `gradedSynapse`, `silentSynapse` | ✅ |
 | synapses defined as custom ComponentTypes (`gradedSynapse2`, …) | ✅ |
-| `iafCell`, `iafRefCell`, `iafTauCell`, `iafTauRefCell` | ⚠️ reset approximated, see below |
+| `iafCell`, `iafRefCell`, `iafTauCell`, `iafTauRefCell` | ✅ exact reset (state assignment) |
 | Validation against `jnml` / NEURON (`tarjuman validate`) | ✅ |
 | `population`, `populationList`, `projection`, `electricalProjection`, `continuousProjection`, weights | ✅ |
 | `pulseGenerator`, `rampGenerator`, `sineGenerator`, `inputList`, `explicitInput` | ✅ |
@@ -158,7 +158,10 @@ back on the way out, using the dimensions the `ComponentType` declares.
 | `channelDensityNernst` | ⚠️ needs an explicit `erev` (`erev_overrides`) |
 | Synaptic `delay` | ✅ shift register; needs `delta_t` at build time |
 | `tsodyksMarkram` short-term plasticity | ⚠️ ignored, synapse converted without it |
-| `ionChannelKS`, `gateKS`, `gateFractional` | ❌ not yet |
+| `gateFractional` and `subGate` (weighted subgate kinetics) | ✅ |
+| Custom `timeCourse`/`steadyState` reading the parent gate's `alpha`/`beta` | ✅ |
+| Recording `iDensity`, `gDensity`, `fopen` | ✅ |
+| `ionChannelKS`, `gateKS` | ❌ not yet |
 | `channelDensityGHK` | ❌ not yet |
 | `izhikevich2007Cell`, `adExIaFCell`, `pointCellCondBased`, PyNN cells | ❌ not yet |
 | Spike sources (`spikeArray`, `spikeGenerator*`, `poissonFiringSynapse`) | ❌ not yet |
@@ -179,11 +182,11 @@ and each approximation also raises a `ConversionWarning` where it happens.
 
 ## Known limits
 
-**Integrate-and-fire reset.** NeuroML assigns the voltage on threshold
-crossing; Jaxley has no state-assignment mechanism. `tarjuman` switches on a
-large conductance towards the reset potential for one step (and any refractory
-period). The firing rate comes out right — measured ISI 20.77 ms against an
-analytic 20.79 ms — but the reset is an approximation and is reported as one.
+**Integrate-and-fire spikes are not differentiable.** The reset is a state
+assignment, exactly as NeuroML specifies (measured ISI 20.800 ms against an
+analytic 20.794 ms), but writing the voltage on a threshold crossing is a step
+function, so the gradient through a spike is zero. Sub-threshold parameters
+stay differentiable. Jaxley's own `Fire` mechanism carries the same caveat.
 
 **Cells that gather their own synaptic input.** A LEMS cell reads its synaptic
 current with `<DerivedVariable select="synapses[*]/i" reduce="add"/>`. In
@@ -206,6 +209,33 @@ connection `delay` becomes a shift register over the presynaptic voltage
 is fixed when the model is built, the step must be known then: `run_lems()`
 takes it from the LEMS file, `from_neuroml()` accepts `delta_t=`. Without it
 the delay is dropped and the report says so.
+
+## Independent validation
+
+tarjuman has been validated by **Hengye Zhu** (@HengyeZhu), a NeuroML editor,
+using a two-level approach that separates translation correctness from
+integrator differences — Jaxley, jnml and jnml-neuron differ in numerical
+integration and update ordering, so a single point-wise comparison conflates
+the two:
+
+- **channels** against jnml, via LEMS tests generated with NeuroML's
+  `NML2ChannelAnalysis`;
+- **cells and networks** against independently handwritten Jaxley models built
+  from the original NeuroML files.
+
+| examples | passed | max absolute voltage error | spike timing deviation |
+| --- | ---: | ---: | ---: |
+| Ex5, Ex10, Ex15, Ex20a, Ex24, Ex25 | 6/6 | 1.092e-9 mV | 0 ms |
+| c302 C Oscillator | 1/1 | 2.548e-12 mV | 0 ms |
+
+```bash
+python tests/neuroml/run.py
+```
+
+That harness pins the upstream model commits, records their licences, and runs
+in float64 — which is what makes agreement at 1e-9 mV meaningful rather than a
+float32 artefact. Several real bugs were found and fixed this way; see the
+changelog for 0.5.0.
 
 ## Validation against the reference simulator
 
@@ -373,9 +403,10 @@ Two things belong in Jaxley rather than here, and `tarjuman` works around both:
 
 1. Kinetic-scheme channels (`ionChannelKS`).
 2. Spike sources (`spikeArray`, `spikeGeneratorPoisson`) as presynaptic drivers.
-3. The remaining point cells (`izhikevich2007Cell`, `adExIaFCell`). Jaxley has
-   integrate-and-fire mechanisms on the way for its 1.0 release, which should
-   replace tarjuman's conductance-clamp approximation entirely.
+3. The remaining point cells. Jaxley already ships `AdEx` and `Izhikevich`
+   mechanisms in `jaxley.channels.non_capacitive`, so `adExIaFCell` and
+   `izhikevich2007Cell` should map onto them directly rather than needing a
+   bespoke implementation.
 4. `channelDensityNernst` computed from the pool, and `channelDensityGHK`.
 5. A CI job comparing traces against `pynml`/`jnml` across the NeuroML example
    suite and the c302 parameter sets.
@@ -387,6 +418,13 @@ Two things belong in Jaxley rather than here, and `tarjuman` works around both:
 NetPyNE, EDEN, Brian and MOOSE: it takes the simulator-independent description
 and makes it run. The difference is what you get on the other side — a JAX
 program you can differentiate, batch and put on an accelerator.
+
+## Credits
+
+tarjuman is written by Aslan Satary Dizaji. The NeuroML validation suite in
+`tests/neuroml/`, the fractional-gate and parent-requirement support, the
+calcium-pool and recording fixes, and the synaptic threshold semantics are the
+work of [Hengye Zhu](https://github.com/HengyeZhu).
 
 ## License
 

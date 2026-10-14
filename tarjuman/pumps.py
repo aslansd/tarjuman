@@ -150,15 +150,12 @@ class NeuroMLConcentrationModel(Pump):
 
     def compute_current(self, states: dict, modified_state, params: dict):
         """Return ``-d[ion]/dt`` in mM/ms, as Jaxley's implicit step expects."""
-        si_parameters = dict(self._si_parameters(params))
-        requirements = self._requirements(states, params)
-        context = dict(si_parameters)
-        context.update(requirements)
+        requirements = self._si_parameters(params)
+        requirements.update(self._requirements(states, params))
         # `modified_state` is the concentration Jaxley is linearising around.
-        context["concentration"] = to_si(modified_state, "concentration")
-
-        for name, function in self.dynamics._derived:
-            context[name] = function(context)
+        context = self.dynamics.evaluate(
+            {"concentration": to_si(modified_state, "concentration")}, requirements
+        )
 
         derivative_si = self.dynamics._time_derivatives["concentration"](context)
         # mol/m3/s -> mM/ms

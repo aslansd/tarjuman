@@ -14,11 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
+import jax.numpy as jnp
 import jaxley as jx
 import numpy as np
 
 from . import ir
 from .builder import ConvertedModel, build
+from .channels import NeuroMLChannel
 from .errors import ParseError
 from .reader import parse_quantity_path, read_lems, read_neuroml
 from .report import ConversionReport
@@ -65,7 +67,11 @@ class SimulationResult:
         time = self.time / 1e3 if in_si_units else self.time
         columns = [time]
         for key, trace in self.traces.items():
-            scale = 1e-3 if (in_si_units and self.quantities.get(key, "").endswith("v")) else 1.0
+            state = self.quantities.get(key, "").rsplit("/", 1)[-1]
+            scale = (
+                {"v": 1e-3, "iDensity": -10.0, "gDensity": 1e4}.get(state, 1.0)
+                if in_si_units else 1.0
+            )
             columns.append(trace * scale)
         np.savetxt(path, np.column_stack(columns), fmt="%g", delimiter="\t")
         return path
@@ -140,10 +146,7 @@ def simulate(
     if records is None:
         records = _default_records(model)
 
-    keys = []
-    for quantity in records:
-        key = _add_recording(model, quantity)
-        keys.append((key, quantity))
+    recordings = [_add_recording(model, quantity) for quantity in records]
 
     if apply_stimuli:
         model.apply_stimuli(delta_t=delta_t, t_max=t_max)
@@ -151,20 +154,28 @@ def simulate(
     if init_states:
         module.init_states(delta_t=delta_t)
 
-    voltages = jx.integrate(
+    recorded = jx.integrate(
         module,
         delta_t=delta_t,
         t_max=t_max,
         solver=solver,
         voltage_solver=voltage_solver,
     )
-    voltages = np.asarray(voltages)
-    time = np.arange(voltages.shape[1]) * delta_t
+    # Jaxley deduplicates recordings. Several LEMS paths, and the dependencies
+    # of derived quantities, can therefore share the same recorded row.
+    rows = {
+        (row.rec_index, row.state): index
+        for index, row in enumerate(module.recordings.itertuples())
+    }
+    time = np.arange(recorded.shape[1]) * delta_t
 
     return SimulationResult(
         time=time,
-        traces={key: voltages[index] for index, (key, _) in enumerate(keys)},
-        quantities={key: quantity for key, quantity in keys},
+        traces={
+            recording.quantity: recording.values(recorded, rows, module.nodes)
+            for recording in recordings
+        },
+        quantities={recording.quantity: recording.quantity for recording in recordings},
         model=model,
     )
 
@@ -234,6 +245,35 @@ def run_lems(
 # --------------------------------------------------------------------------- #
 # Recording helpers
 # --------------------------------------------------------------------------- #
+@dataclass
+class _Recording:
+    """A LEMS output and the compartment states needed to evaluate it."""
+
+    quantity: str
+    index: int
+    states: tuple[str, ...]
+    channel: Optional[NeuroMLChannel] = None
+    exposure: Optional[str] = None
+
+    def values(self, recorded, rows: dict, nodes) -> np.ndarray:
+        states = {state: recorded[rows[self.index, state]] for state in self.states}
+        if self.channel is None:
+            return np.asarray(states[self.states[0]])
+
+        channel = self.channel
+        params = {
+            name: jnp.asarray(nodes.loc[self.index, name])
+            for name in channel.channel_params
+        }
+        v = states["v"]
+        value = channel.compute_open_fraction(states, v, params)
+        if self.exposure in ("iDensity", "gDensity"):
+            value = params[f"{channel.name}_gbar"] * value
+        if self.exposure == "iDensity":
+            value = value * (v - params[f"{channel.name}_erev"])
+        return np.asarray(jnp.broadcast_to(value, v.shape))
+
+
 def _default_records(model: ConvertedModel) -> list[str]:
     if model.network is None:
         return ["0/0/v"]
@@ -245,33 +285,92 @@ def _default_records(model: ConvertedModel) -> list[str]:
     return records
 
 
-def _add_recording(model: ConvertedModel, quantity: str) -> str:
-    """Record one LEMS quantity path and return the key it will be stored under."""
-    parsed = parse_quantity_path(quantity)
+def _recording_view(model: ConvertedModel, parsed: dict):
+    """Validate each component in an output path against the source model."""
+    quantity = parsed["raw"]
     population = parsed["population"]
-    if model.network is None or population not in {
-        p.id for p in model.network.populations
-    }:
+    if model.network is None:
+        cell_id = model.cell_types[0]
+        if population not in ("0", cell_id) or parsed["cell"] != 0:
+            raise ParseError(f"No cell matching output path {quantity!r}.")
         population = None
+    else:
+        index = model.cell_index.get((population, parsed["cell"]))
+        if index is None:
+            raise ParseError(f"No population instance matching output path {quantity!r}.")
+        cell_id = model.cell_types[index]
 
-    view = model.view(
+    if parsed["component"] is not None and parsed["component"] != cell_id:
+        raise ParseError(f"Output path {quantity!r} does not refer to cell {cell_id!r}.")
+
+    if parsed["density"] is not None:
+        cell = model.document.cells.get(cell_id)
+        properties = cell.biophysical_properties if cell is not None else None
+        if properties is None or parsed["biophysics"] != properties.id:
+            raise ParseError(
+                f"Unknown biophysical properties in output path {quantity!r}."
+            )
+        density = next(
+            (d for d in properties.channel_densities if d.id == parsed["density"]),
+            None,
+        )
+        if density is None:
+            raise ParseError(f"Unknown channel density in output path {quantity!r}.")
+        if parsed["channel"] is not None and parsed["channel"] != density.ion_channel:
+            raise ParseError(f"Unknown ion channel in output path {quantity!r}.")
+        if parsed["gate"] is not None:
+            channel = model.document.ion_channels[density.ion_channel]
+            if not any(gate.id == parsed["gate"] for gate in channel.gates):
+                raise ParseError(f"Unknown gate in output path {quantity!r}.")
+
+    return model.view(
         population,
         parsed["cell"],
         parsed["segment"] if parsed["segment"] is not None else 0,
         0.5,
     )
 
+
+def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
+    """Resolve one LEMS output and record the states it depends on."""
+    parsed = parse_quantity_path(quantity)
+    view = _recording_view(model, parsed)
     state = parsed["state"]
-    if state == "v":
+    if parsed["density"] is not None:
+        name = parsed["density"]
+        channel = next(
+            (channel for channel in model.module.channels if channel.name == name),
+            None,
+        )
+        if not isinstance(channel, NeuroMLChannel) or not bool(
+            view.nodes.iloc[0].get(name, False)
+        ):
+            raise ParseError(
+                f"Cannot record {quantity!r}: channel density {parsed['density']!r} "
+                "was not converted on this compartment; see `model.report.summary()`."
+            )
+        if parsed["gate"] is None:
+            supported = (
+                ("iDensity", "gDensity") if parsed["channel"] is None else ("fopen",)
+            )
+            if state not in supported:
+                raise ParseError(f"Unsupported channel output path {quantity!r}.")
+            # Shared ion currents and cached pre-solve currents cannot supply
+            # a channel's output at the actual sampling time. Use its states.
+            states = tuple(dict.fromkeys(["v", *channel.channel_states]))
+            for dependency in states:
+                view.record(dependency, verbose=False)
+            return _Recording(quantity, view.nodes.index[0], states, channel, state)
+        if state != "q":
+            raise ParseError(f"Unsupported gate output {quantity!r}; only q is recorded.")
+        # Jaxley names gate states "<channelDensity id>_<gate id>".
+        jaxley_state = f"{parsed['density']}_{parsed['gate']}"
+
+    elif state == "v":
         jaxley_state = "v"
     elif state in _ION_CONCENTRATION_STATES:
         # A cell's exposed ion concentration, e.g. "AVBL/0/GenericNeuronCell/caConc".
         jaxley_state = _ION_CONCENTRATION_STATES[state]
-    elif parsed["density"] is not None and parsed["gate"] is not None:
-        # Jaxley names gate states "<channelDensity id>_<gate id>".
-        jaxley_state = f"{parsed['density']}_{parsed['gate']}"
-    elif parsed["density"] is not None and state in ("i", "iDensity"):
-        jaxley_state = f"i_{parsed['density']}"
     elif "synapses:" in quantity:
         raise ParseError(
             f"tarjuman cannot record the synapse quantity {quantity!r} yet; record "
@@ -297,4 +396,4 @@ def _add_recording(model: ConvertedModel, quantity: str) -> str:
             "`model.report.summary()`. States available on this compartment: "
             f"{', '.join(sorted(available)) or 'v'}."
         ) from error
-    return quantity
+    return _Recording(quantity, view.nodes.index[0], (jaxley_state,))

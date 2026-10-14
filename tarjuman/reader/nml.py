@@ -61,6 +61,11 @@ _GATE_TAGS = {
     "gateFractional",
     "gateKS",
 }
+_ION_CHANNEL_METADATA_TAGS = {
+    "notes",
+    "annotation",
+    "property",
+}
 _SYNAPSE_TAGS = {
     "alphaSynapse",
     "expOneSynapse",
@@ -238,6 +243,21 @@ def _read_gate(
     q10 = _first(element, "q10Settings")
 
     gate = ir.Gate(id=gate_id, instances=instances, kind=kind)
+    if kind == "gateFractional":
+        gate.sub_gates = [
+            _read_gate(child, context, custom_types)
+            for child in _children(element, "subGate")
+        ]
+        if not gate.sub_gates:
+            raise ParseError(f"{context} has no subGate elements.")
+        sub_gate_ids = [child.id for child in gate.sub_gates]
+        if len(sub_gate_ids) != len(set(sub_gate_ids)):
+            raise ParseError(f"{context} has duplicate subGate ids.")
+    elif kind == "subGate":
+        fraction = element.get("fractionalConductance")
+        if fraction is None:
+            raise ParseError(f"{context} is missing fractionalConductance.")
+        gate.fractional_conductance = float(fraction)
     for part, part_element, reader in (
         ("forward_rate", forward, _read_rate),
         ("reverse_rate", reverse, _read_rate),
@@ -276,14 +296,26 @@ def _read_ion_channel(
     gates: list[ir.Gate] = []
     for gate_element in _children(element, *gate_tags):
         gate_kind = _component_type(gate_element)
-        if gate_kind in ("gateKS", "gateFractional"):
+        if gate_kind == "gateKS":
             report.unsupported(
                 context,
                 f"gate '{gate_element.get('id')}' is a {gate_kind}; kinetic-scheme "
-                "and fractional gates are not yet translated, the gate is skipped",
+                "gates are not yet translated, the gate is skipped",
             )
             continue
         gates.append(_read_gate(gate_element, context, custom_types))
+
+    for child in element:
+        tag = _tag(child)
+        if tag in gate_tags or tag in _ION_CHANNEL_METADATA_TAGS:
+            continue
+        if tag == "q10ConductanceScaling":
+            continue
+        report.unsupported(
+            context,
+            f"child <{tag} id='{child.get('id')}'> is not supported; the "
+            "channel is built without it",
+        )
 
     conductance = element.get("conductance")
     scaling = _first(element, "q10ConductanceScaling")

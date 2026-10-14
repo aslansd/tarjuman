@@ -52,10 +52,6 @@ __all__ = [
 POINT_CELL_AREA = 100.0
 #: Radius of that compartment in um; the length follows from the area.
 POINT_CELL_RADIUS = 5.0
-#: Conductance towards the reset potential while spiking, in S/cm2.  Large
-#: enough that one implicit step lands on the reset value.
-RESET_CONDUCTANCE = 100.0
-
 #: NeuroML point cell types tarjuman can build.
 SUPPORTED_POINT_CELLS = {
     "iafCell",
@@ -71,7 +67,21 @@ _PF_PER_UM2_TO_UF_PER_CM2 = 100.0
 
 
 class IntegrateAndFire(Channel):
-    """Leak plus threshold-and-reset, as one Jaxley channel.
+    """Leak, threshold and reset: a NeuroML integrate-and-fire cell.
+
+    NeuroML specifies the reset as a *state assignment* — ``OnCondition
+    test="v .gt. thresh"`` with ``StateAssignment variable="v" value="reset"``
+    — and Jaxley supports exactly that: a non-capacitive channel may return
+    ``"v"`` from ``update_states`` and the integrator takes it. (Jaxley's own
+    ``Leak`` + ``Fire`` pair does the same thing; this keeps them as one
+    channel so the refractory period, which ``Fire`` has no notion of, can be
+    handled in the same place.) The reset is therefore exact rather than
+    approximated.
+
+    One consequence is worth knowing: a reset writes the voltage, and a
+    threshold crossing is a step function, so the gradient through a spike is
+    zero. Sub-threshold parameters stay differentiable; spike timing does not.
+    Jaxley's own ``Fire`` warns about the same thing, for the same reason.
 
     Args:
         name: Channel name.
@@ -100,10 +110,9 @@ class IntegrateAndFire(Channel):
             f"{prefix}_thresh": float(threshold),
             f"{prefix}_reset": float(reset),
             f"{prefix}_refract": float(refractory),
-            f"{prefix}_gReset": float(RESET_CONDUCTANCE),
         }
         self.channel_states = {
-            f"{prefix}_spiking": 0.0,
+            f"{prefix}_spikes": 0.0,
             f"{prefix}_refractory": 0.0,  # ms remaining
         }
         self.current_name = f"i_{prefix}"
@@ -112,27 +121,31 @@ class IntegrateAndFire(Channel):
     def update_states(
         self, states: dict[str, Array], dt: float, v: float, params: dict[str, Array]
     ) -> dict[str, Array]:
+        """Assign the reset voltage on a threshold crossing, as NeuroML does."""
         prefix = self._name
-        crossed = (v >= params[f"{prefix}_thresh"]).astype(jnp.result_type(float))
+        threshold = params[f"{prefix}_thresh"]
+        reset = params[f"{prefix}_reset"]
+
+        # NeuroML's condition is strictly greater than the threshold.
+        crossed = v > threshold
         remaining = jnp.maximum(states[f"{prefix}_refractory"] - dt, 0.0)
-        remaining = jnp.where(crossed > 0, params[f"{prefix}_refract"], remaining)
-        spiking = jnp.maximum(crossed, (remaining > 0).astype(jnp.result_type(float)))
+        remaining = jnp.where(crossed, params[f"{prefix}_refract"], remaining)
+        # The cell is held at the reset potential for the refractory period,
+        # which is what iafRefCell and iafTauRefCell mean by one.
+        held = jnp.logical_or(crossed, remaining > 0.0)
+
         return {
-            f"{prefix}_spiking": spiking,
+            "v": jnp.where(held, reset, v),
+            f"{prefix}_spikes": crossed.astype(jnp.result_type(float)),
             f"{prefix}_refractory": remaining,
         }
 
     def compute_current(
         self, states: dict[str, Array], v: float, params: dict[str, Array]
     ) -> Array:
+        """The leak current; the reset is an assignment, not a current."""
         prefix = self._name
-        leak = params[f"{prefix}_gLeak"] * (v - params[f"{prefix}_eLeak"])
-        clamp = (
-            states[f"{prefix}_spiking"]
-            * params[f"{prefix}_gReset"]
-            * (v - params[f"{prefix}_reset"])
-        )
-        return leak + clamp
+        return params[f"{prefix}_gLeak"] * (v - params[f"{prefix}_eLeak"])
 
     def init_state(
         self,
@@ -142,7 +155,7 @@ class IntegrateAndFire(Channel):
         delta_t: float,
     ) -> dict[str, ArrayLike]:
         prefix = self._name
-        return {f"{prefix}_spiking": 0.0, f"{prefix}_refractory": 0.0}
+        return {f"{prefix}_spikes": 0.0, f"{prefix}_refractory": 0.0}
 
 
 def point_cell_threshold(point_cell: ir.PointCell) -> Optional[float]:
@@ -229,12 +242,13 @@ def build_point_cell(
     cell.insert(channel)
     cell.set("v", e_leak)
 
-    report.approximation(
+    report.info(
         context,
-        "integrate-and-fire reset is approximated: crossing threshold switches on "
-        f"a {RESET_CONDUCTANCE:g} S/cm2 conductance towards {reset:g} mV for one "
-        "step (and any refractory period) instead of assigning the voltage, "
-        "because Jaxley has no state-assignment mechanism",
+        f"integrate-and-fire cell: threshold {threshold:g} mV, reset {reset:g} mV"
+        + (f", refractory {parameters['refract']:g} ms" if parameters.get("refract") else "")
+        + ". The reset is a state assignment, as NeuroML specifies; the "
+        "gradient through a spike is therefore zero, though sub-threshold "
+        "parameters stay differentiable",
     )
 
     branch = BranchSpec(

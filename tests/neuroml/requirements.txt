@@ -1,0 +1,4 @@
+# Validation environment; install the checkout separately with pip install -e .
+jax[cpu]==0.10.2
+jaxley==0.14.0
+numpy==2.4.6

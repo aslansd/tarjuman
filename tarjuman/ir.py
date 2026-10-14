@@ -118,6 +118,8 @@ class Gate:
     #: unconverted because their dimensions come from the ComponentType.
     custom: Optional["CustomComponent"] = None
     custom_parts: dict[str, "CustomComponent"] = field(default_factory=dict)
+    sub_gates: list["Gate"] = field(default_factory=list)
+    fractional_conductance: Optional[float] = None
 
     @property
     def is_custom(self) -> bool:

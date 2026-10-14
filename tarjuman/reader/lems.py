@@ -14,6 +14,7 @@ implements those types natively.
 from __future__ import annotations
 
 import os
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
@@ -160,45 +161,40 @@ def parse_quantity_path(quantity: str) -> dict:
         "density": None,
         "channel": None,
         "gate": None,
+        "component": None,
+        "biophysics": None,
         "raw": quantity,
     }
 
-    parts = [part for part in text.split("/") if part not in ("", "..")]
-    if not parts:
-        raise ParseError(f"Empty quantity path {quantity!r}.")
+    parts = text.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ParseError(f"Unsupported quantity path {quantity!r}.")
 
-    head = parts[0]
-    if "[" in head and head.endswith("]"):
-        result["population"] = head[: head.index("[")]
-        result["cell"] = int(head[head.index("[") + 1 : -1])
-        rest = parts[1:]
+    head = re.fullmatch(r"([^\[\]]+)(?:\[([0-9]+)\])?", parts[0])
+    if head is None:
+        raise ParseError(f"Invalid population or cell index in {quantity!r}.")
+    result["population"] = head[1]
+    rest = parts[1:]
+    if head[2] is not None:
+        result["cell"] = int(head[2])
+    elif rest and rest[0].isdigit():
+        result["cell"] = int(rest.pop(0))
+        if len(rest) > 1 and not rest[0].isdigit():
+            result["component"] = rest.pop(0)
+
+    if rest and rest[0].isdigit():
+        result["segment"] = int(rest.pop(0))
+
+    if len(rest) == 1:
+        result["state"] = rest[0]
+    elif len(rest) in (4, 5, 6) and rest[1] == "membraneProperties":
+        result["biophysics"] = rest[0]
+        result["density"] = rest[2]
+        result["state"] = rest[-1]
+        if len(rest) >= 5:
+            result["channel"] = rest[3]
+        if len(rest) == 6:
+            result["gate"] = rest[4]
     else:
-        result["population"] = head
-        rest = parts[1:]
-        if rest and rest[0].isdigit():
-            result["cell"] = int(rest[0])
-            rest = rest[1:]
-            if rest:  # skip the component name in populationList paths
-                rest = rest[1:]
-
-    if not rest:
-        result["state"] = "v"
-        return result
-
-    result["state"] = rest[-1]
-    if rest[0].isdigit():
-        result["segment"] = int(rest[0])
-        rest = rest[1:]
-        if len(rest) == 1:
-            return result
-
-    if "membraneProperties" in rest:
-        index = rest.index("membraneProperties")
-        tail = rest[index + 1 :]
-        if tail:
-            result["density"] = tail[0]
-        if len(tail) >= 2:
-            result["channel"] = tail[1]
-        if len(tail) >= 3:
-            result["gate"] = tail[2]
+        raise ParseError(f"Unsupported quantity path {quantity!r}.")
     return result

@@ -417,7 +417,14 @@ def test_iaf_cell_fires_at_the_analytic_rate():
     v_infinity = -50.0 + current / 1e-4
     expected = tau * np.log((v_infinity + 50.0) / (v_infinity + 30.0))
     assert measured == pytest.approx(expected, rel=0.02)
-    assert report.approximations  # the reset is an approximation, and says so
+    # The reset is a state assignment, as NeuroML specifies, so it is no longer
+    # an approximation: the voltage never passes the threshold and lands exactly
+    # on the reset value.
+    assert not report.approximations
+    # The trace records the crossing step before the reset is applied, so the
+    # peak sits one step past the threshold and no further.
+    assert -30.0 < voltage.max() < -29.9
+    assert voltage.min() == pytest.approx(-50.0, abs=1e-4)
 
 
 def test_iaf_reset_lands_on_the_reset_potential():
@@ -431,8 +438,10 @@ def test_iaf_reset_lands_on_the_reset_potential():
     )
     cell.init_states(delta_t=dt)
     voltage = np.asarray(jx.integrate(cell, delta_t=dt, t_max=200.0))[0]
-    assert voltage.max() < -29.0  # never overshoots threshold
-    assert voltage.min() == pytest.approx(-50.0, abs=0.2)
+    # One step past the threshold at most, and the reset is exact rather than
+    # a conductance clamp converging towards the reset value.
+    assert -30.0 < voltage.max() < -29.9
+    assert voltage.min() == pytest.approx(-50.0, abs=1e-4)
 
 
 def test_refractory_period_lengthens_the_interval():

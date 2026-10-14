@@ -68,15 +68,28 @@ class _EventSynapse(Synapse):
             f"{prefix}_threshold": float(threshold),  # mV
             f"{prefix}_weight": float(weight),
         }
-        self.synapse_states = {f"{prefix}_pre_v_prev": _VERY_NEGATIVE}
+        self.synapse_states = {
+            f"{prefix}_pre_v_prev": _VERY_NEGATIVE,
+            f"{prefix}_spiking": 0.0,
+        }
 
     def _detect_spike(self, states, pre_voltage, params) -> Array:
         """1.0 on an upward threshold crossing since the previous step."""
         prefix = self._name
         threshold = params[f"{prefix}_threshold"]
-        previous = states[f"{prefix}_pre_v_prev"]
-        crossed = jnp.logical_and(previous < threshold, pre_voltage >= threshold)
+        spiking = states[f"{prefix}_spiking"]
+        crossed = jnp.logical_and(spiking < 0.5, pre_voltage > threshold)
         return crossed.astype(jnp.result_type(float))
+
+    def _update_spiking(self, states, pre_voltage, params) -> Array:
+        """Keep the firing state until voltage falls below the threshold."""
+        prefix = self._name
+        threshold = params[f"{prefix}_threshold"]
+        return jnp.where(
+            pre_voltage < threshold,
+            0.0,
+            jnp.where(pre_voltage > threshold, 1.0, states[f"{prefix}_spiking"]),
+        )
 
 
 class ExpTwoSynapse(_EventSynapse):
@@ -127,6 +140,7 @@ class ExpTwoSynapse(_EventSynapse):
             f"{prefix}_A": new_a,
             f"{prefix}_B": new_b,
             f"{prefix}_pre_v_prev": pre_voltage,
+            f"{prefix}_spiking": self._update_spiking(states, pre_voltage, params),
         }
 
     def compute_current(self, states, pre_voltage, post_voltage, params):
@@ -218,7 +232,11 @@ class ExpOneSynapse(_EventSynapse):
             -delta_t / params[f"{prefix}_tauDecay"]
         )
         new_g = decayed + spike * params[f"{prefix}_weight"] * params[f"{prefix}_gbase"]
-        return {f"{prefix}_g": new_g, f"{prefix}_pre_v_prev": pre_voltage}
+        return {
+            f"{prefix}_g": new_g,
+            f"{prefix}_pre_v_prev": pre_voltage,
+            f"{prefix}_spiking": self._update_spiking(states, pre_voltage, params),
+        }
 
     def compute_current(self, states, pre_voltage, post_voltage, params):
         prefix = self._name
@@ -260,6 +278,7 @@ class AlphaSynapse(_EventSynapse):
             f"{prefix}_g": new_g,
             f"{prefix}_A": a * decay,
             f"{prefix}_pre_v_prev": pre_voltage,
+            f"{prefix}_spiking": self._update_spiking(states, pre_voltage, params),
         }
 
     def compute_current(self, states, pre_voltage, post_voltage, params):
