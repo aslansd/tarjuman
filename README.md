@@ -31,21 +31,76 @@ model.module.make_trainable("naChans_m_alpha_midpoint")   # now fit it to data
 pip install tarjuman
 ```
 
-Optional extras: `tarjuman[neuroml]` to read models straight from `libNeuroML`
-objects, `tarjuman[plot]` for the CLI's `--plot`, `tarjuman[examples]` for the
-example scripts.
+Optional extras:
+
+| extra | pulls in | for |
+|---|---|---|
+| `tarjuman[neuroml]` | `libNeuroML` | reading models straight from `libNeuroML` objects |
+| `tarjuman[plot]` | `matplotlib` | the CLI's `--plot` |
+| `tarjuman[examples]` | `matplotlib`, `optax` | the four example scripts |
+| `tarjuman[validate]` | `pyneuroml`, `neuron` | `tarjuman validate` and `tarjuman converge` |
+| `tarjuman[dev]` | the above plus `pytest`, `ruff` | running the test suite |
+
+```bash
+pip install "tarjuman[dev]"     # everything needed to reproduce this README
+```
 
 ## Command line
 
+Five subcommands. Each one below is a real command with its real output.
+
 ```bash
-tarjuman info    model.nml                    # what is in this file?
-tarjuman convert model.nml --script run.py    # convert, report, emit a script
-tarjuman run     tests/data/LEMS_hh_single_comp.xml --output v.dat
+tarjuman info NeuroML2/examples/NML2_SingleCompHHCell.nml
+```
+```
+NeuroML document: NML2_SingleCompHHCell  (.../NML2_SingleCompHHCell.nml)
+  ion channels (3): kChan, naChan, passiveChan
+  cells (1): hhcell
+  inputs (1): pulseGen1
+  networks (1): net1
+  network 'net1':
+    population 'hhpop': 1 x 'hhcell'
+  cell 'hhcell': 1 segments, 3 channel densities
+```
+
+```bash
+tarjuman convert NeuroML2/examples/NML2_SingleCompHHCell.nml --script hh.py
+```
+```
+tarjuman conversion report for .../NML2_SingleCompHHCell.nml
+  1 cells, 1 branches, 1 compartments, 0 synapses
+  [approximation] cell 'hhcell' segment 0: zero-length (spherical) segment
+    converted to a cylinder of length = diameter = 17.8412 um, preserving surface area
+wrote hh.py
+```
+
+`--script` writes a standalone Jaxley script, so you can take the conversion
+and leave tarjuman behind.
+
+```bash
+tarjuman run tests/data/LEMS_hh_single_comp.xml --output v.dat
+```
+```
+simulated 300.0 ms, 3 traces recorded
+wrote v.dat
 ```
 
 `tarjuman run` on a LEMS file reproduces the experiment the file describes —
 duration, time step, inputs, and the quantities its `OutputFile` elements ask
-for — and writes them in the same SI column format `jnml` writes.
+for — and writes them in the same SI column format `jnml` writes, so the two
+outputs are diffable:
+
+```
+0        -0.065      0.0529325   0.317677
+1e-05    -0.0649997  0.0529325   0.317677
+```
+
+Add `--plot out.png` for a figure instead, and `--ncomp N` /
+`--max-comp-length L` to control compartmentalisation.
+
+`tarjuman validate` and `tarjuman converge` are the two that call the reference
+simulator; both are described under *Validation against the reference
+simulator* below.
 
 ## The C. elegans connectome
 
@@ -223,19 +278,40 @@ the two:
 - **cells and networks** against independently handwritten Jaxley models built
   from the original NeuroML files.
 
-| examples | passed | max absolute voltage error | spike timing deviation |
-| --- | ---: | ---: | ---: |
-| Ex5, Ex10, Ex15, Ex20a, Ex24, Ex25 | 6/6 | 1.092e-9 mV | 0 ms |
-| c302 C Oscillator | 1/1 | 2.548e-12 mV | 0 ms |
-
 ```bash
-python tests/neuroml/run.py
+python tests/neuroml/run.py                 # all seven models
+python tests/neuroml/run.py --model ex25     # just one
+python tests/neuroml/run.py --output results # keep the voltage arrays
+```
+```
+ex5:                PASS; max voltage error 3.237e-11 mV; spike deviation 0 ms
+ex10:               PASS; max voltage error 1.680e-11 mV; spike deviation 0 ms
+ex15:               PASS; max voltage error 1.092e-09 mV; spike deviation 0 ms
+ex20a:              PASS; max voltage error 6.055e-11 mV; spike deviation 0 ms
+ex24:               PASS; max voltage error 1.375e-11 mV; spike deviation 0 ms
+ex25:               PASS; max voltage error 4.015e-11 mV; spike deviation 0 ms
+c302_c_oscillator:  PASS; max voltage error 2.548e-12 mV; spike deviation 0 ms
+7/7 passed
 ```
 
-That harness pins the upstream model commits, records their licences, and runs
-in float64 — which is what makes agreement at 1e-9 mV meaningful rather than a
+The models are downloaded on first use at pinned upstream commits, with their
+licences recorded in `tests/neuroml/models.json`, and the harness enables
+float64 — which is what makes agreement at 1e-11 mV meaningful rather than a
 float32 artefact. Several real bugs were found and fixed this way; see the
 changelog for 0.5.0.
+
+The pass tolerance is 1 nanovolt (`TOLERANCE = 1e-6` mV), relative and
+absolute, and a run above 1e-8 mV still passes but says so. That is not
+slack — it is portability. The converted and handwritten models are the *same*
+computation, so the only difference between them is the order the
+floating-point operations end up in, and that is not reproducible across
+machines: Apple Silicon contracts fused multiply-adds differently from x86 and
+links a different BLAS, so over tens of thousands of integration steps the two
+separate by a few parts in 10⁹ on the steep part of a spike. The `ex25` figure
+above is 4.0e-11 on x86_64 and 2.2e-9 on an M-series Mac, with the traces
+agreeing to nine significant figures either way. Any genuine mistranslation —
+a wrong unit, a dropped channel, a misapplied Q10 — moves a trace by 0.1 mV or
+more, five orders of magnitude above the bar.
 
 ## Validation against the reference simulator
 
@@ -245,7 +321,23 @@ which is what a NeuroML user needs to know.
 
 ```bash
 pip install "tarjuman[validate]"      # pyneuroml + neuron
-tarjuman validate tests/data/LEMS_hh_single_comp.xml
+tarjuman validate NeuroML2/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml
+```
+```
+PASS  LEMS_NML2_Ex5_DetCell.xml
+  ok   v: spikes 7 vs 7, sub-threshold RMS 0.382 mV, spike shift -0.415 ms (drift -0.1139 ms/ISI)
+  ok   m: max |diff| 0.739,  RMS 0.08445, r=0.89930
+  ok   h: max |diff| 0.1793, RMS 0.02195, r=0.98828
+  ok   n: max |diff| 0.2177, RMS 0.02268, r=0.97959
+  jlems 4.0s, tarjuman 3.9s (1.0x)
+```
+
+It takes several files at once, and the tolerances and the engine are flags:
+
+```bash
+tarjuman validate NeuroML2/LEMSexamples/LEMS_NML2_Ex*.xml
+tarjuman validate LEMS_NML2_Ex25_MultiComp.xml --engine neuron
+tarjuman validate LEMS_hh_single_comp.xml --rms 1.0 --spike-shift 0.5 --dt 0.001
 ```
 
 Every path in this README is a real file, either bundled with tarjuman or in a
@@ -262,13 +354,14 @@ java -version                   # should print a version, not an error
 ```
 
 The tests that use the reference simulator skip when it is unavailable, and
-`tarjuman validate` says what is missing.
+`tarjuman validate` says what is missing rather than failing obscurely:
 
-```
-PASS  LEMS_NML2_Ex5_DetCell.xml
-  ok   v: spikes 7 vs 7, sub-threshold RMS 0.382 mV, spike shift -0.415 ms (drift -0.1139 ms/ISI)
-  ok   m: max |diff| 0.739, RMS 0.08445, r=0.89930
-  jlems 2.2s, tarjuman 1.7s (1.3x)
+```python
+>>> from tarjuman.validate import reference_available, reference_problem
+>>> reference_available()          # actually invokes jnml, not just a PATH check
+True
+>>> reference_problem() is None    # None means jLEMS will run
+True
 ```
 
 Measured on the NeuroML example suite:
@@ -315,10 +408,22 @@ register crossings in one simulator and none in the other.
 integrates explicitly and Jaxley implicitly, so the two approach the exact
 solution from opposite sides:
 
+```bash
+tarjuman converge tests/data/LEMS_hh_single_comp.xml
+tarjuman converge tests/data/LEMS_hh_single_comp.xml --steps 0.01 0.001 0.0005
+```
+```
+convergence of mean inter-spike interval: LEMS_hh_single_comp.xml
+   dt (ms)     reference      tarjuman        diff
+      0.01      16.16728      16.05303    -0.11425
+     0.005      16.09751      16.03911    -0.05840
+     0.001      16.04001      16.02810    -0.01191
+```
+
 | `dt` (ms) | jLEMS mean ISI | tarjuman |
 |---|---|---|
-| 0.01 | 16.163 | 16.049 |
-| 0.001 | 16.036 | 16.024 |
+| 0.01 | 16.167 | 16.053 |
+| 0.001 | 16.040 | 16.028 |
 | 0.0005 | **16.029** | **16.024** |
 
 The 0.7% discrepancy at `dt = 0.01` is entirely jLEMS's discretisation error.
@@ -348,7 +453,30 @@ PosixPath('.../site-packages/neuron/.data')
 True
 ```
 
-Setting `NEURON_HOME` yourself overrides the search.
+Setting `NEURON_HOME` yourself overrides the search. On macOS the compiler
+comes from the Xcode command-line tools (`xcode-select --install`); without
+them `tarjuman validate` reports the mod-file compilation failure with the
+compiler's own error, rather than a Java stack trace.
+
+With that in place a multicompartmental model validates end to end:
+
+```bash
+tarjuman validate NeuroML2/LEMSexamples/LEMS_NML2_Ex25_MultiComp.xml
+```
+```
+PASS  LEMS_NML2_Ex25_MultiComp.xml
+  ok   of0.0: spikes 12 vs 12, sub-threshold RMS 0.278 mV, spike shift -0.112 ms (drift -0.0207 ms/ISI)
+  ok   of0.3: spikes 12 vs 12, sub-threshold RMS 0.067 mV, spike shift -0.046 ms (drift -0.0197 ms/ISI)
+  ok   of1.0: spikes  7 vs  7, sub-threshold RMS 0.366 mV, spike shift -0.319 ms (drift +0.0002 ms/ISI)
+  ...
+  neuron 9.2s, tarjuman 11.2s (0.8x)
+```
+
+Three segments, Na/K channels, AMPA and NMDA synapses, 12 recorded traces,
+spike counts equal in every one. That is the one check the handwritten-Jaxley
+harness cannot make — it compares tarjuman against a model written by hand from
+the same NeuroML file, so a misreading shared by both would pass. NEURON read
+the NeuroML independently.
 
 ## Correctness
 
@@ -371,8 +499,107 @@ simulator:
 - Plus gap-junction symmetry, threshold-crossing counting, segment-group
   targeting, and `(segment, fractionAlong)` → `(branch, compartment)` mapping.
 
+## Reproducing everything in this README
+
+Everything above, in order, from a fresh clone. `$NML` is a
+[NeuroML2](https://github.com/NeuroML/NeuroML2) checkout and `$C302` a
+[c302](https://github.com/openworm/c302) one.
+
 ```bash
-pytest          # 95 tests
+git clone https://github.com/aslansd/tarjuman && cd tarjuman
+pip install -e ".[dev]"
+brew install --cask temurin          # macOS: a real JDK for jnml
+xcode-select --install               # macOS: a compiler for NEURON's mod files
+
+pytest -q                                              # 126 tests
+python tests/neuroml/run.py                            # 7 conversions
+
+python examples/01_run_neuroml_cell.py
+python examples/02_fit_a_channel_parameter.py
+python examples/03_c302_connectome.py $C302/examples/LEMS_c302_C_Oscillator.xml
+python examples/04_validate_against_jnml.py $NML/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml
+
+tarjuman info     $NML/examples/NML2_SingleCompHHCell.nml
+tarjuman convert  $NML/examples/NML2_SingleCompHHCell.nml --script hh.py
+tarjuman run      tests/data/LEMS_hh_single_comp.xml --output v.dat
+tarjuman run      $C302/examples/LEMS_c302_C_Oscillator.xml --plot oscillator.png
+tarjuman validate tests/data/LEMS_hh_single_comp.xml
+tarjuman validate $NML/LEMSexamples/LEMS_NML2_Ex25_MultiComp.xml   # via NEURON
+tarjuman converge tests/data/LEMS_hh_single_comp.xml
+```
+
+The rest of this section is what each of those prints.
+
+### The examples
+
+Four scripts, each self-contained and each printing what it checked.
+`03` and `04` take a path; `01` and `02` use bundled fixtures.
+
+```bash
+
+python examples/01_run_neuroml_cell.py
+python examples/02_fit_a_channel_parameter.py
+python examples/03_c302_connectome.py  c302/examples/LEMS_c302_C_Oscillator.xml
+python examples/04_validate_against_jnml.py \
+    NeuroML2/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml
+python examples/04_validate_against_jnml.py LEMS_NML2_Ex5_DetCell.xml --converge
+```
+
+`01` converts a Hodgkin-Huxley cell, prints the branch geometry and writes
+`hh_cell.png`:
+
+```
+jx.Network
+      length    radius  capacitance
+0  17.841242  8.920621          1.0
+wrote hh_cell.png
+```
+
+`02` is the point of the package: it takes a NeuroML sodium conductance,
+perturbs it, and recovers it by gradient descent through the converted model.
+
+```
+Number of newly added trainable parameters: 1. Total number of trainable parameters: 1
+step   0  loss   491.4646  naChans_gbar 0.0600
+step  20  loss   184.6497  naChans_gbar 0.1211
+step  40  loss    38.3713  naChans_gbar 0.1204
+step  50  loss     2.2555  naChans_gbar 0.1205
+recovered 0.1196 S/cm2 (NeuroML file says 0.12)
+```
+
+`03` converts the C. elegans connectome and reports what is now trainable:
+
+```
+tarjuman conversion report for .../LEMS_c302_C_Oscillator.xml
+  14 cells, 14 branches, 14 compartments, 79 synapses
+wrote c302.png  (28 traces)
+calcium pools: ['CaPool']
+e.g. model.module.make_trainable('CaPool_decayConstant') to fit the pool to data
+```
+
+### The test suites
+
+Two of them, answering different questions.
+
+```bash
+pytest -q                           # 126 tests: the package's own behaviour
+python tests/neuroml/run.py         # 7 models: conversions against NeuroML
+```
+
+```
+126 passed
+7/7 passed
+```
+
+`pytest` needs nothing beyond `[dev]`; the reference-simulator tests inside it
+skip cleanly when `jnml` or Java is absent, rather than failing. The NeuroML
+harness is Hengye Zhu's and downloads its models on first run.
+
+```bash
+pytest -q tests/test_validate.py     # 30 tests: the comparison machinery itself
+pytest -q tests/test_lems_and_c302.py
+pytest -q -k iaf -v                  # one topic, verbosely
+ruff check tarjuman tests            # lint
 ```
 
 ## Design notes
@@ -438,10 +665,30 @@ program you can differentiate, batch and put on an accelerator.
 
 ## Credits
 
-tarjuman is written by Aslan Satary Dizaji. The NeuroML validation suite in
-`tests/neuroml/`, the fractional-gate and parent-requirement support, the
-calcium-pool and recording fixes, and the synaptic threshold semantics are the
-work of [Hengye Zhu](https://github.com/HengyeZhu).
+tarjuman is written by Aslan Satary Dizaji.
+
+[Hengye Zhu](https://github.com/HengyeZhu) (@HengyeZhu), a NeuroML editor,
+contributed the independent validation of the package and the fixes it turned
+up — most of release 0.5.0:
+
+- the NeuroML validation suite in `tests/neuroml/`, including the
+  `NML2ChannelAnalysis`-generated channel tests and the handwritten Jaxley
+  reference models;
+- `gateFractional` and `subGate` support (weighted subgate kinetics, inherited
+  Q10 scaling, `fopen` recording);
+- custom `timeCourse`/`steadyState` components reading the parent gate's
+  `alpha`/`beta`, which had silently blocked any such channel;
+- the calcium-pool constants fix, without which every shell-based pool raised;
+- recording rows resolved against the model structure rather than by position,
+  and `iDensity`/`gDensity` with the right scaling and sign;
+- NeuroML's synaptic threshold semantics (latched while above threshold,
+  rearmed only below, strictly-greater comparison);
+- and the observation that a Jaxley channel may return `"v"` from
+  `update_states`, which is what made the exact integrate-and-fire reset
+  possible.
+
+See the changelog for 0.5.0, where each of these is described as the bug it
+fixed.
 
 ## License
 
