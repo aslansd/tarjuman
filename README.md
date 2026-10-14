@@ -333,6 +333,23 @@ with "Level of support: NONE". For those models `engine="auto"` falls back to
 exporting the model to NEURON and running that, which is how the `Ex25` row
 above was measured.
 
+That fallback needs NEURON (`pip install neuron`, or `pip install
+"tarjuman[validate]"`), and a C++ compiler for it to compile the exported mod
+files with. `jnml` does not look on the PATH for NEURON — it reads
+`NEURON_HOME` and otherwise tries a fixed list of install prefixes from the
+days of source builds — so tarjuman locates NEURON itself and tells `jnml`
+where it is. If it cannot, it says so and how to fix it:
+
+```python
+>>> from tarjuman.validate import neuron_home, neuron_problem
+>>> neuron_home()
+PosixPath('.../site-packages/neuron/.data')
+>>> neuron_problem() is None       # None means the NEURON engine will run
+True
+```
+
+Setting `NEURON_HOME` yourself overrides the search.
+
 ## Correctness
 
 The package is also checked against things that do not depend on either
