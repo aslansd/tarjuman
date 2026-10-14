@@ -1,6 +1,59 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.1
+
+Two problems a user hit on a Mac that neither test suite could see from Linux.
+
+### `tests/neuroml/run.py` compared float64 traces to an absolute 2 pV
+
+The converted and handwritten models are the same computation, so the only
+difference between them is the order the floating-point operations end up in,
+and that is not reproducible across machines: Apple Silicon contracts fused
+multiply-adds differently from x86 and links a different BLAS. Over tens of
+thousands of integration steps the two traces separate by a few parts in 10^9
+on the steep part of a spike. `Ex25` therefore failed on macOS at 2.16e-9 mV
+against a 2e-9 tolerance, while the same run on x86_64 gives 4.0e-11 — and the
+19 samples it failed on agreed to nine significant figures.
+
+The tolerance is now 1e-6 mV, relative and absolute: one nanovolt. Any genuine
+mistranslation — a wrong unit, a dropped channel, a misapplied Q10 — moves a
+trace by 0.1 mV or more, so this keeps five orders of magnitude of margin for
+catching real regressions. Runs above 1e-8 mV still pass but say so, because a
+jump from 1e-11 to 1e-7 means something changed even if it is not yet wrong.
+
+### `validate --engine neuron` could not find a pip-installed NEURON
+
+`jnml` does not search the PATH for NEURON. It reads `NEURON_HOME` and
+otherwise tries a fixed list of prefixes from the days of source builds
+(`/usr/local/nrn/x86_64` and friends). A pip-installed NEURON matches none of
+them, so `pip install neuron` ended in the bare Java error `Could not find
+NEURON home directory!` while `nrniv` sat on the PATH all along — which is
+every multicompartmental model, since jLEMS refuses those outright.
+
+`neuron_home()` now finds it, in the wheel (`neuron/.data`) or from the PATH,
+and `run_reference` passes it to `jnml`. Two further wheel quirks had to be
+handled to get an actual run, both of which NEURON's own PATH wrappers paper
+over and `jnml` bypasses by calling into `$NEURON_HOME/bin` directly:
+
+- the wheel's `nrngui` and `nrnivmodl` shell scripts still carry the temporary
+  prefix they were built under and fall back to it unless `NRNHOME` is set;
+- the wheel's makefile hardcodes the compiler of the build image
+  (`/opt/rh/gcc-toolset-10/.../g++`), so `CC` and `CXX` are now set to a
+  compiler that exists.
+
+With all three, `LEMS_NML2_Ex25_MultiComp` validates against NEURON and
+passes: 12 recorded traces across a three-segment cell with Na/K channels and
+AMPA/NMDA synapses, spike counts matching exactly, sub-threshold RMS 0.05–0.48
+mV and spike shifts under 0.35 ms. That is the first multicompartmental
+conversion checked against NEURON rather than against a handwritten Jaxley
+model.
+
+A NEURON that still will not run is now explained — `neuron_problem()`, in the
+shape of `reference_problem()` — along with a mod-file compilation failure,
+rather than being passed through as a Java stack trace.
+
+
+## 0.5.0
 
 Most of this release is the work of **Hengye Zhu** (@HengyeZhu), a NeuroML
 editor, who validated tarjuman against the NeuroML reference tooling, found
@@ -72,7 +125,7 @@ The gradient through a spike is zero, since a reset writes the voltage and a
 threshold crossing is a step. Sub-threshold parameters remain differentiable.
 Jaxley's `Fire` carries the same caveat for the same reason.
 
-## 0.4.2 — unreleased
+## 0.4.2
 
 - Every path in the README and the examples is now a real file, either bundled
   with tarjuman or in a NeuroML2 / c302 checkout beside it. The old
@@ -80,7 +133,7 @@ Jaxley's `Fire` carries the same caveat for the same reason.
 - A missing LEMS file is reported once, as a missing file, instead of being
   rediscovered by each reference engine and reported twice.
 
-## 0.4.1 — unreleased
+## 0.4.1
 
 - `reference_available()` now checks that `jnml` actually runs, not merely that
   the script is on the PATH. `pip install pyneuroml` installs that script with
@@ -90,7 +143,7 @@ Jaxley's `Fire` carries the same caveat for the same reason.
   `reference_problem()` says what is wrong and how to fix it, and
   `tarjuman validate` prints it.
 
-## 0.4.0 — unreleased
+## 0.4.0
 
 Validation against the reference NeuroML simulator, answering the question the
 test suite could not: agreement with analytic references says the equations
@@ -144,7 +197,7 @@ rather than disagreement.
   cannot ignore its input. The free decay is exact; the response to injected
   current is not, and the conversion report says so.
 
-## 0.3.0 — unreleased
+## 0.3.0
 
 Acts on the Jaxley developers' answers in
 [jaxleyverse/jaxley#810](https://github.com/jaxleyverse/jaxley/issues/810).
@@ -179,7 +232,7 @@ are applied in groups too.
 - The `pumped_ions` workaround is annotated with jaxleyverse/jaxley#811, where
   it is confirmed as a bug; it becomes a no-op once the fix lands.
 
-## 0.2.1 — unreleased
+## 0.2.1
 
 - Unresolved `<include>` / `<Include>` elements are now reported instead of
   skipped quietly. A LEMS file only points at the NeuroML files it includes,
@@ -190,7 +243,7 @@ are applied in groups too.
   definitions (`Cells.xml`, `Channels.xml`, …) are still skipped silently,
   since tarjuman implements them natively.
 
-## 0.2.0 — unreleased
+## 0.2.0
 
 Built against the OpenWorm models: c302 parameter sets A, C, C0, C1 and C2 now
 convert and run.
@@ -250,7 +303,7 @@ and as synapses, where `select="peer/v"` resolves to the presynaptic voltage.
 - `jx.Network(cells)` does not carry over the pumped-ion list from its cells;
   tarjuman restores it so the integrator solves for the concentrations.
 
-## 0.1.0 — unreleased
+## 0.1.0
 
 First working version.
 

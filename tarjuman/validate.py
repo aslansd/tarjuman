@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -50,6 +51,8 @@ __all__ = [
     "ValidationResult",
     "reference_available",
     "reference_problem",
+    "neuron_home",
+    "neuron_problem",
     "run_reference",
     "compare_traces",
     "auto_threshold",
@@ -272,6 +275,119 @@ ENGINES = {
 }
 
 
+def neuron_home() -> Optional[Path]:
+    """Where ``jnml`` should look for NEURON, or ``None`` if it is not found.
+
+    ``jnml`` does not search the PATH for NEURON. It reads ``NEURON_HOME`` and
+    otherwise tries a fixed list of install prefixes from the days of source
+    builds (``/usr/local/nrn/x86_64`` and friends), expecting ``bin/nriv``
+    under each. A pip-installed NEURON matches none of them, which is how
+    ``pip install neuron`` ends in the bare Java error "Could not find NEURON
+    home directory!" while ``nrniv`` sits happily on the PATH. So find it here
+    and tell ``jnml`` where it is.
+
+    Returns:
+        A directory containing ``bin/nrniv``, or ``None``.
+    """
+    existing = os.environ.get("NEURON_HOME")
+    if existing and (Path(existing) / "bin" / "nrniv").exists():
+        return Path(existing)
+
+    candidates: list[Path] = []
+    try:  # The wheel keeps its binaries in the package, under `.data`.
+        import neuron  # noqa: PLC0415  (optional dependency)
+
+        candidates.append(Path(neuron.__file__).resolve().parent / ".data")
+    except Exception:  # pragma: no cover - NEURON is optional
+        pass
+
+    executable = shutil.which("nrniv")
+    if executable:
+        # `<prefix>/bin/nrniv`, or a venv shim pointing into the real prefix.
+        resolved = Path(executable).resolve()
+        candidates.extend([Path(executable).parent.parent, resolved.parent.parent])
+
+    for candidate in candidates:
+        if (candidate / "bin" / "nrniv").exists():
+            return candidate
+    return None
+
+
+def neuron_problem() -> Optional[str]:
+    """Why the NEURON engine is unusable, or ``None`` if it is fine."""
+    if neuron_home() is not None:
+        return None
+    return (
+        "jnml needs NEURON for multicompartmental models and cannot find it. "
+        "Install it with `pip install neuron`, or point jnml at an existing "
+        "install by setting NEURON_HOME to the directory holding `bin/nrniv`. "
+        "Note that jnml ignores the PATH, so `nrniv` being runnable is not "
+        "enough on its own."
+    )
+
+
+def _compiler(variable: str, fallbacks: Sequence[str]) -> Optional[str]:
+    """A compiler that exists, for ``nrnivmodl`` to compile mod files with.
+
+    The wheel's makefile hardcodes the compiler its manylinux image was built
+    with (``/opt/rh/gcc-toolset-10/root/usr/bin/g++``), which exists on nobody
+    else's machine. NEURON's own PATH wrapper repairs that by exporting ``CC``
+    and ``CXX`` before handing over; ``jnml`` calls the makefile's script
+    directly and so misses it.
+    """
+    import sysconfig
+
+    candidates = [sysconfig.get_config_var(variable) or "", *fallbacks]
+    for candidate in candidates:
+        name = candidate.split()[0] if candidate else ""
+        if name and shutil.which(name):
+            return candidate
+    return None
+
+
+def _c_compiler() -> Optional[str]:
+    return _compiler("CC", ("cc", "gcc", "clang"))
+
+
+def _cxx_compiler() -> Optional[str]:
+    return _compiler("CXX", ("c++", "g++", "clang++"))
+
+
+def _reference_environment(engine: str) -> dict[str, str]:
+    """The environment to run ``jnml`` in, with NEURON located for it.
+
+    ``jnml`` calls ``$NEURON_HOME/bin/nrngui`` and ``nrnivmodl`` directly.
+    In a pip-installed NEURON those two are shell scripts that still carry the
+    temporary prefix the wheel was built under (``/tmp/tmp…/wheel/platlib``),
+    and they fall back to it unless ``NRNHOME`` is set — the PATH versions are
+    Python wrappers that set it, which is why ``nrniv`` works from a shell but
+    not when ``jnml`` reaches past the wrapper. Setting it here is what makes
+    ``pip install neuron`` enough.
+    """
+    environment = dict(os.environ)
+    if engine != "neuron":
+        return environment
+
+    home = neuron_home()
+    if home is None:
+        raise ReferenceUnavailable(neuron_problem())
+    environment["NEURON_HOME"] = str(home)
+    environment.setdefault("NRNHOME", str(home))
+    environment.setdefault("CORENRNHOME", str(home))
+    environment.setdefault("NEURONHOME", str(home / "share" / "nrn"))
+    environment.setdefault("NMODLHOME", str(home))
+    environment.setdefault("NRN_PYTHONEXE", sys.executable)
+    environment.setdefault("CORENRN_PYTHONEXE", sys.executable)
+    for variable, compiler in (("CC", _c_compiler()), ("CXX", _cxx_compiler())):
+        if compiler:
+            environment.setdefault(variable, compiler)
+    # nrnivmodl compiles the exported mod files, and it is beside nrniv.
+    binaries = str(home / "bin")
+    if binaries not in environment.get("PATH", "").split(os.pathsep):
+        environment["PATH"] = binaries + os.pathsep + environment.get("PATH", "")
+    return environment
+
+
 def run_reference(
     lems_path: str | os.PathLike,
     timeout: int = 900,
@@ -329,16 +445,32 @@ def run_reference(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_reference_environment(engine),
         )
         if process.returncode != 0:
             message = _reference_error(process)
-            if "MULTICOMPARTMENTAL_CELL_MODEL" in (process.stdout or "") + (
-                process.stderr or ""
-            ):
+            output = (process.stdout or "") + (process.stderr or "")
+            if "MULTICOMPARTMENTAL_CELL_MODEL" in output:
                 message = (
                     "jLEMS cannot simulate multicompartmental cells (it reports "
                     "'Level of support: NONE'). Use engine='neuron' for this "
                     "model."
+                )
+            elif "NEURON home directory" in output:
+                # NEURON_HOME was set from neuron_home() and jnml still refused,
+                # so the directory exists but is not the one it wants.
+                message = (
+                    f"jnml rejected the NEURON install at {neuron_home()}. Set "
+                    "NEURON_HOME to a directory holding `bin/nrniv` from a "
+                    "NEURON build jnml accepts. Original error: " + message
+                )
+            elif "Unsuccessful compilation of NEURON mod files" in output:
+                message = (
+                    "NEURON could not compile the exported mod files "
+                    "(`nrnivmodl`). A C++ compiler is needed, plus the ncurses "
+                    "and readline development packages. The compiler error is "
+                    "in the lines marked 'NMODL Error'. Original error: "
+                    + message
                 )
             raise ReferenceUnavailable(
                 f"jnml failed on {lems_path.name} (exit {process.returncode}): "

@@ -396,6 +396,63 @@ def test_no_reference_problem_is_reported_when_it_works(monkeypatch):
     module.reference_available.cache_clear()
 
 
+def test_neuron_is_found_where_pip_puts_it(monkeypatch, tmp_path):
+    """jnml reads NEURON_HOME and a list of 1990s install prefixes, not the PATH.
+
+    A pip-installed NEURON matches none of those prefixes, so `pip install
+    neuron` used to end in the bare Java error "Could not find NEURON home
+    directory!" while `nrniv` sat on the PATH all along.
+    """
+    import sys
+    import types
+
+    from tarjuman import validate as module
+
+    package = tmp_path / "site-packages" / "neuron"
+    home = package / ".data"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "nrniv").write_text("#!/bin/sh\n")
+
+    monkeypatch.delenv("NEURON_HOME", raising=False)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    stub = types.ModuleType("neuron")
+    stub.__file__ = str(package / "__init__.py")
+    monkeypatch.setitem(sys.modules, "neuron", stub)
+
+    assert module.neuron_home() == home
+    assert module.neuron_problem() is None
+
+    # And from the PATH, for a NEURON that was not installed by pip.
+    monkeypatch.setitem(sys.modules, "neuron", None)
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name: str(home / "bin" / "nrniv")
+    )
+    assert module.neuron_home() == home
+
+    environment = module._reference_environment("neuron")
+    assert environment["NEURON_HOME"] == str(home)
+    # The wheel's own nrngui and nrnivmodl scripts fall back to the temporary
+    # prefix they were built under unless NRNHOME is set.
+    assert environment["NRNHOME"] == str(home)
+
+
+def test_a_missing_neuron_is_explained_rather_than_left_to_java(monkeypatch):
+    from tarjuman import validate as module
+
+    monkeypatch.delenv("NEURON_HOME", raising=False)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    monkeypatch.setitem(__import__("sys").modules, "neuron", None)
+
+    assert module.neuron_home() is None
+    problem = module.neuron_problem()
+    assert problem is not None and "pip install neuron" in problem
+
+    with pytest.raises(module.ReferenceUnavailable):
+        module._reference_environment("neuron")
+    # jLEMS needs none of this, so it is left alone.
+    assert "NEURON_HOME" not in module._reference_environment("jlems")
+
+
 def test_a_missing_file_is_reported_once(tmp_path):
     """Not once per reference engine, and not as a stack trace."""
     result = validate_lems(tmp_path / "LEMS_NotHere.xml")
