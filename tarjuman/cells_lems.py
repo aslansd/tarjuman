@@ -539,10 +539,13 @@ class LemsPointCell(Channel):
         equation there, because ``update_states`` runs before the currents are
         computed and has already written the reset.
 
-        The prediction leaves out the stimulus and synaptic currents, which
-        this cell never sees.  Where it matters — within a step of threshold,
-        on the steep part of the exponential — the cell's own current exceeds
-        those by orders of magnitude.
+        The prediction leaves out the stimulus and synaptic currents, which a
+        channel is not handed.  They are not lost: writing ``"v"`` does not
+        replace Jaxley's voltage solve, which continues from the written value
+        and adds them, so the step is split rather than skipped.  Only the
+        *test* ignores them, and where the test matters — within a step of
+        threshold, on the steep part of the exponential — the cell's own
+        current exceeds them by orders of magnitude.
         """
         prefix = self._name
         dt_si = to_si(dt, "time")
