@@ -164,23 +164,31 @@ def point_cell_threshold(point_cell: ir.PointCell) -> Optional[float]:
 
 
 def build_point_cell(
-    point_cell: ir.PointCell, report: ConversionReport
+    point_cell: ir.PointCell,
+    report: ConversionReport,
+    component_types: Optional[dict] = None,
 ) -> tuple[jx.Cell, CellMorphology]:
     """Build a single-compartment Jaxley cell from a NeuroML point cell.
 
+    The integrate-and-fire family is built by :class:`IntegrateAndFire`, whose
+    leak-threshold-reset shape is fixed and validated.  Every other abstract
+    cell — ``izhikevich2007Cell``, ``adExIaFCell``, and the ones models define
+    themselves — is driven by its own LEMS dynamics through
+    :class:`~tarjuman.cells_lems.LemsPointCell`.
+
     Args:
         point_cell: The IR point cell.
-        report: Conversion report; the reset approximation is recorded here.
+        report: Conversion report; approximations are recorded here.
+        component_types: ComponentTypes the document defines, for cells
+            interpreted from their LEMS dynamics.
 
     Returns:
         The Jaxley cell and a one-segment morphology map, so that the rest of
         tarjuman can address it exactly like a multicompartmental cell.
     """
     if point_cell.kind not in SUPPORTED_POINT_CELLS:
-        raise UnsupportedComponentError(
-            f"Point cell '{point_cell.id}' has type '{point_cell.kind}'. tarjuman "
-            f"builds {', '.join(sorted(SUPPORTED_POINT_CELLS))}; other abstract "
-            "cells carry extra state variables with their own reset rules."
+        return _build_interpreted_point_cell(
+            point_cell, report, component_types or {}
         )
 
     parameters = point_cell.params
@@ -268,3 +276,65 @@ def build_point_cell(
         groups={"all": [0], "soma_group": [0]},
     )
     return cell, morphology
+
+
+def _point_cell_morphology(cell_id: str, length: float) -> CellMorphology:
+    """The one-segment morphology map every point cell gets."""
+    branch = BranchSpec(
+        index=0,
+        segments=[0],
+        lengths=[length],
+        radii=[POINT_CELL_RADIUS],
+        parent=-1,
+        ncomp=1,
+        xyzr=np.array([[0.0, 0.0, 0.0, POINT_CELL_RADIUS]] * 2),
+    )
+    return CellMorphology(
+        cell_id=cell_id,
+        branches=[branch],
+        segment_to_branch={0: 0},
+        segment_offset={0: 0.0},
+        groups={"all": [0], "soma_group": [0]},
+    )
+
+
+def _build_interpreted_point_cell(
+    point_cell: ir.PointCell, report: ConversionReport, component_types: dict
+) -> tuple[jx.Cell, CellMorphology]:
+    """An abstract cell driven by the LEMS dynamics its ComponentType declares."""
+    from .cells_lems import make_lems_point_cell
+
+    channel = make_lems_point_cell(point_cell, component_types, POINT_CELL_AREA)
+
+    length = POINT_CELL_AREA / (2.0 * np.pi * POINT_CELL_RADIUS)
+    cell = jx.Cell(jx.Branch(jx.Compartment(), ncomp=1), parents=[-1])
+    cell.set("radius", POINT_CELL_RADIUS)
+    cell.set("length", length)
+    cell.set("axial_resistivity", 100.0)
+    cell.set(
+        "capacitance",
+        channel.capacitance_pf / POINT_CELL_AREA * _PF_PER_UM2_TO_UF_PER_CM2,
+    )
+    cell.insert(channel)
+    cell.set("v", channel.resting_potential)
+
+    context = f"{point_cell.kind} '{point_cell.id}'"
+    states = sorted(channel._state_dimensions)
+    report.info(
+        context,
+        f"abstract cell interpreted from its LEMS dynamics"
+        + (f", with state variables {states}" if states else "")
+        + ". Jaxley's solver integrates the membrane potential, so the "
+        "stimulus and synaptic currents the NeuroML cell gathers with "
+        "select=\"synapses[*]/i\" reach it through the solver rather than "
+        "through the cell. Any reset is a state assignment, as NeuroML "
+        "specifies, so the gradient through a spike is zero",
+    )
+    if channel.regimes is not None:
+        report.info(
+            context,
+            "the refractory period is expressed in NeuroML as a second LEMS "
+            "regime whose exit is timed against the simulation clock; it is "
+            "counted down in the cell instead, which a Jaxley channel can do",
+        )
+    return cell, _point_cell_morphology(point_cell.id, length)

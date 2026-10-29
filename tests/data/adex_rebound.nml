@@ -1,0 +1,14 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="adex_rebound">
+    <!-- NeuroML's own adExRebound parameters (LEMSexamples/LEMS_NML2_Ex8_AdEx.xml).
+         Its detection threshold sits 24 mV above VT, which is what makes it the
+         interesting case: there is a band of voltages where the membrane
+         conductance is already regenerative but no reset has fired yet. -->
+    <adExIaFCell id="adExRebound" C="281pF" gL="30nS" EL="-60mV" reset="-51mV"
+                 VT="-54mV" thresh="-30mV" delT="2mV" tauw="150ms"
+                 a="200nS" b="0.1nA" refract="0ms"/>
+    <pulseGenerator id="hyperpolarise" delay="150ms" duration="50ms" amplitude="-0.5nA"/>
+    <network id="adexNet">
+        <population id="reboundPop" component="adExRebound" size="1"/>
+        <explicitInput target="reboundPop[0]" input="hyperpolarise" destination="synapses"/>
+    </network>
+</neuroml>

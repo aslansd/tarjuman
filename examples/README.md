@@ -5,9 +5,11 @@
 | `01_run_neuroml_cell.py` | convert a NeuroML cell, run it, record voltage and gate variables |
 | `02_fit_a_channel_parameter.py` | recover a `channelDensity` conductance by gradient descent through the converted model |
 | `03_c302_connectome.py` | run a c302 *C. elegans* model: custom LEMS gates, calcium pools, gap junctions |
+| `04_validate_against_jnml.py` | compare a conversion against the reference simulator, with a convergence study |
+| `05_abstract_cells.py` | run `izhikevich2007Cell` and `adExIaFCell`, and show where a spiking equation needs explicit integration |
 
-Both use the fixtures in `tests/data`, so they run without downloading
-anything. Install the extras first:
+`01`, `02` and `05` use the fixtures in `tests/data`, so they run without
+downloading anything. Install the extras first:
 
 ```bash
 pip install tarjuman[examples]

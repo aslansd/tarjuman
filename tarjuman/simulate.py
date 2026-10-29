@@ -22,6 +22,7 @@ from . import ir
 from .builder import ConvertedModel, build
 from .channels import NeuroMLChannel
 from .errors import ParseError
+from .units import to_si
 from .reader import parse_quantity_path, read_lems, read_neuroml
 from .report import ConversionReport
 
@@ -43,6 +44,8 @@ class SimulationResult:
     time: np.ndarray  # ms
     traces: dict[str, np.ndarray] = field(default_factory=dict)
     quantities: dict[str, str] = field(default_factory=dict)
+    #: Trace name -> LEMS dimension, where the recording knew one.
+    dimensions: dict[str, str] = field(default_factory=dict)
     model: Optional[ConvertedModel] = None
 
     def __getitem__(self, key: str) -> np.ndarray:
@@ -67,11 +70,17 @@ class SimulationResult:
         time = self.time / 1e3 if in_si_units else self.time
         columns = [time]
         for key, trace in self.traces.items():
+            if not in_si_units:
+                columns.append(trace)
+                continue
+            dimension = self.dimensions.get(key)
+            if dimension is not None and dimension != "none":
+                # The recording knew what it was measuring, so convert by
+                # dimension rather than by recognising the state's name.
+                columns.append(np.asarray(to_si(trace, dimension)))
+                continue
             state = self.quantities.get(key, "").rsplit("/", 1)[-1]
-            scale = (
-                {"v": 1e-3, "iDensity": -10.0, "gDensity": 1e4}.get(state, 1.0)
-                if in_si_units else 1.0
-            )
+            scale = {"v": 1e-3, "iDensity": -10.0, "gDensity": 1e4}.get(state, 1.0)
             columns.append(trace * scale)
         np.savetxt(path, np.column_stack(columns), fmt="%g", delimiter="\t")
         return path
@@ -176,6 +185,11 @@ def simulate(
             for recording in recordings
         },
         quantities={recording.quantity: recording.quantity for recording in recordings},
+        dimensions={
+            recording.quantity: recording.dimension
+            for recording in recordings
+            if recording.dimension is not None
+        },
         model=model,
     )
 
@@ -231,14 +245,17 @@ def run_lems(
         for _, column_id, _ in simulation.outputs:
             counts[column_id] = counts.get(column_id, 0) + 1
 
-        renamed, quantities = {}, {}
+        renamed, quantities, dimensions = {}, {}, {}
         for (file_id, column_id, quantity), key in zip(
             simulation.outputs, result.traces
         ):
             name = column_id if counts[column_id] == 1 else f"{file_id}.{column_id}"
             renamed[name] = result.traces[key]
             quantities[name] = quantity
+            if key in result.dimensions:
+                dimensions[name] = result.dimensions[key]
         result.traces, result.quantities = renamed, quantities
+        result.dimensions = dimensions
     return result, model
 
 
@@ -254,6 +271,10 @@ class _Recording:
     states: tuple[str, ...]
     channel: Optional[NeuroMLChannel] = None
     exposure: Optional[str] = None
+    #: LEMS dimension of the recorded quantity, where it is known. ``save``
+    #: converts by dimension rather than by guessing from the state's name,
+    #: which is what lets an abstract cell's own exposures come out in SI.
+    dimension: Optional[str] = None
 
     def values(self, recorded, rows: dict, nodes) -> np.ndarray:
         states = {state: recorded[rows[self.index, state]] for state in self.states}
@@ -331,6 +352,43 @@ def _recording_view(model: ConvertedModel, parsed: dict):
     )
 
 
+def _point_cell_state(
+    model: ConvertedModel, view, state: str
+) -> Optional[tuple[str, str]]:
+    """The Jaxley state and LEMS dimension behind a point cell's own exposure.
+
+    An abstract cell's state variables — ``izhikevich2007Cell``'s ``u``,
+    ``adExIaFCell``'s ``w`` — are channel states on the compartment the cell
+    became, so they can be recorded directly.  Exposures the cell does not
+    compute cannot: ``iSyn`` and ``iMemb`` are derived from the synaptic
+    current Jaxley's solver assembles, which the cell never sees, so a number
+    for them would be the membrane current with the synapses left out.
+    """
+    from .cells_lems import LemsPointCell
+
+    for channel in model.module.channels:
+        if not isinstance(channel, LemsPointCell):
+            continue
+        if not bool(view.nodes.iloc[0].get(channel.name, False)):
+            continue
+        if state in channel._state_dimensions:
+            return f"{channel.name}_{state}", channel._state_dimensions[state]
+        if state in channel._gathered or state in _GATHERED_EXPOSURES:
+            raise ParseError(
+                f"Cannot record {state!r} on abstract cell {channel.name!r}: it is "
+                "derived from the synaptic current, which Jaxley's solver "
+                "assembles outside the cell. The cell never computes it, so any "
+                "value here would leave the synapses out. Record 'v' instead, or "
+                f"one of {sorted(channel._state_dimensions)}."
+            )
+    return None
+
+
+#: Exposures of a NeuroML abstract cell that are derived from gathered
+#: synaptic current, and so are not available once Jaxley owns the solve.
+_GATHERED_EXPOSURES = frozenset({"iSyn", "iMemb", "ISyn"})
+
+
 def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
     """Resolve one LEMS output and record the states it depends on."""
     parsed = parse_quantity_path(quantity)
@@ -371,6 +429,12 @@ def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
     elif state in _ION_CONCENTRATION_STATES:
         # A cell's exposed ion concentration, e.g. "AVBL/0/GenericNeuronCell/caConc".
         jaxley_state = _ION_CONCENTRATION_STATES[state]
+    elif _point_cell_state(model, view, state) is not None:
+        jaxley_state, dimension = _point_cell_state(model, view, state)
+        view.record(jaxley_state, verbose=False)
+        return _Recording(
+            quantity, view.nodes.index[0], (jaxley_state,), dimension=dimension
+        )
     elif "synapses:" in quantity:
         raise ParseError(
             f"tarjuman cannot record the synapse quantity {quantity!r} yet; record "

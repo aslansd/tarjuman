@@ -44,6 +44,7 @@ import numpy as np
 from .errors import TarjumanError
 from .reader import read_lems
 from .simulate import run_lems
+from .units import convert as from_si
 
 __all__ = [
     "ReferenceUnavailable",
@@ -57,6 +58,7 @@ __all__ = [
     "compare_traces",
     "auto_threshold",
     "model_spike_thresholds",
+    "model_reset_drops",
     "validate_lems",
     "convergence_study",
     "spike_times",
@@ -124,6 +126,7 @@ def spike_times(
     voltage: np.ndarray,
     threshold: float = 0.0,
     mode: str = "auto",
+    min_drop: Optional[float] = None,
 ) -> np.ndarray:
     """Spike times of a trace, interpolated to sub-sample accuracy.
 
@@ -139,12 +142,14 @@ def spike_times(
             reset discontinuities, or ``"auto"`` to use crossings where there
             are any and resets otherwise. **Comparing two traces requires the
             same mode for both** — see :func:`detection_mode`.
+        min_drop: Smallest fall counted as a reset, in mV; see
+            :func:`reset_times`.
 
     Returns:
         Spike times in ms.
     """
     if mode == "reset":
-        return reset_times(time, voltage)
+        return reset_times(time, voltage, min_drop)
     crossings = _crossings(time, voltage, threshold)
     if crossings.size or mode == "crossing":
         return crossings
@@ -152,11 +157,14 @@ def spike_times(
     # so whether it registers as crossing turns on floating-point equality at
     # exactly that value. Where nothing rises above the threshold, fall back on
     # the unambiguous marker: the reset itself.
-    return reset_times(time, voltage)
+    return reset_times(time, voltage, min_drop)
 
 
 def detection_mode(
-    time: np.ndarray, voltage: np.ndarray, threshold: float
+    time: np.ndarray,
+    voltage: np.ndarray,
+    threshold: float,
+    min_drop: Optional[float] = None,
 ) -> str:
     """Which detection mode a trace calls for: ``"crossing"`` or ``"reset"``.
 
@@ -166,9 +174,9 @@ def detection_mode(
     and only resets in the other, and the two spike counts are then not
     measuring the same thing.
     """
-    return (
-        "crossing" if _crossings(time, voltage, threshold).size else "reset"
-    )
+    if _crossings(time, voltage, threshold).size:
+        return "crossing"
+    return "reset"
 
 
 def _crossings(
@@ -192,17 +200,36 @@ def _crossings(
 RESET_FRACTION = 0.5
 
 
-def reset_times(time: np.ndarray, voltage: np.ndarray) -> np.ndarray:
+#: Fraction of a model's declared ``thresh - reset`` that still counts as a
+#: reset.  Well below one because the two traces are resampled onto a common
+#: time base before detection, and interpolation splits a one-step fall across
+#: two samples whenever the simulators' sample times are offset — halving the
+#: apparent drop, or worse.  A quarter of the declared fall is still some fifty
+#: times the sub-threshold agreement between the two simulators, so nothing
+#: short of a real reset comes close.
+DECLARED_DROP_FRACTION = 0.25
+
+
+def reset_times(
+    time: np.ndarray, voltage: np.ndarray, min_drop: Optional[float] = None
+) -> np.ndarray:
     """Times of reset discontinuities — a spiking cell's other signature.
 
-    A reset is a single-sample fall of more than :data:`RESET_FRACTION` of the
-    trace's whole range. An action potential repolarises over about a
-    millisecond and so is not mistaken for one; an integrate-and-fire reset
-    happens in one step and is.
+    A reset is a single-sample fall of more than ``min_drop``, or, without one,
+    of more than :data:`RESET_FRACTION` of the trace's whole range. An action
+    potential repolarises over about a millisecond and so is not mistaken for
+    one; an integrate-and-fire reset happens in one step and is.
+
+    Taking the size from the trace fails on an adaptive cell: ``adExIaFCell``
+    resets by ``thresh - reset`` — 8 mV for NeuroML's bursting parameters —
+    while the trace as a whole spans 30 mV, so a fraction of the range sets
+    the bar above every real reset and finds none. The model states the drop it
+    makes, so ``min_drop`` is the better answer wherever the caller knows it.
 
     Args:
         time: Times in ms.
         voltage: Voltages in mV.
+        min_drop: Smallest fall counted as a reset, in mV.
 
     Returns:
         Reset times in ms.
@@ -211,11 +238,15 @@ def reset_times(time: np.ndarray, voltage: np.ndarray) -> np.ndarray:
     voltage = np.asarray(voltage, dtype=float)
     if voltage.size < 3:
         return np.empty(0)
-    span = float(voltage.max() - voltage.min())
-    if span <= 0:
-        return np.empty(0)
+    if min_drop is not None and min_drop > 0:
+        limit = float(min_drop)
+    else:
+        span = float(voltage.max() - voltage.min())
+        if span <= 0:
+            return np.empty(0)
+        limit = RESET_FRACTION * span
     drops = np.diff(voltage)
-    indices = np.where(drops < -RESET_FRACTION * span)[0]
+    indices = np.where(drops < -limit)[0]
     return time[indices]
 
 
@@ -596,6 +627,37 @@ def _read_reference_outputs(directory: Path, simulation) -> dict:
     return traces
 
 
+def model_reset_drops(model) -> dict[str, float]:
+    """How far each population's cells fall on a reset, in mV, by population.
+
+    A cell that declares both a threshold and a reset potential states the size
+    of its own discontinuity, which is a far better detector than a fraction of
+    the trace's range — see :func:`reset_times`. Only a fraction
+    (:data:`DECLARED_DROP_FRACTION`) of the declared drop is required, so that a
+    reset split across two samples still counts.
+
+    Args:
+        model: A :class:`~tarjuman.builder.ConvertedModel`.
+
+    Returns:
+        ``{population id: minimum drop in mV}``, omitting populations whose
+        cells declare no reset.
+    """
+    drops: dict[str, float] = {}
+    if model.network is None:
+        return drops
+    for population in model.network.populations:
+        point_cell = model.document.point_cells.get(population.component)
+        if point_cell is None:
+            continue
+        threshold = point_cell.params.get("thresh")
+        reset = point_cell.params.get("reset")
+        if threshold is None or reset is None or threshold <= reset:
+            continue
+        drops[population.id] = DECLARED_DROP_FRACTION * (threshold - reset)
+    return drops
+
+
 def model_spike_thresholds(model) -> dict[str, float]:
     """Spike thresholds in mV, by population, as the NeuroML model declares them.
 
@@ -702,6 +764,7 @@ def compare_traces(
     quantity: str = "",
     is_voltage: bool = True,
     threshold: Optional[float] = None,
+    reset_drop: Optional[float] = None,
 ) -> TraceComparison:
     """Compare one reference trace with one tarjuman trace.
 
@@ -716,6 +779,9 @@ def compare_traces(
         is_voltage: Whether to apply spike-aware comparison.
         threshold: Spike threshold in mV; chosen from the reference trace by
             :func:`auto_threshold` when omitted.
+        reset_drop: Smallest voltage fall counted as a reset, in mV — the drop
+            the model itself declares, where the caller knows it. See
+            :func:`reset_times`.
 
     Returns:
         A :class:`TraceComparison`.
@@ -757,10 +823,14 @@ def compare_traces(
     comparison.spike_threshold = float(threshold)
 
     # One detection mode, chosen from the reference and used for both.
-    mode = detection_mode(t_ref, v_ref, threshold)
+    mode = detection_mode(t_ref, v_ref, threshold, reset_drop)
     comparison.detection = mode
-    reference_spikes = spike_times(t_ref, v_ref, threshold, mode=mode)
-    candidate_spikes = spike_times(t_ref, v_cand, threshold, mode=mode)
+    reference_spikes = spike_times(
+        t_ref, v_ref, threshold, mode=mode, min_drop=reset_drop
+    )
+    candidate_spikes = spike_times(
+        t_ref, v_cand, threshold, mode=mode, min_drop=reset_drop
+    )
     comparison.n_spikes_reference = int(reference_spikes.size)
     comparison.n_spikes_tarjuman = int(candidate_spikes.size)
 
@@ -906,11 +976,19 @@ def validate_lems(
         return result
 
     thresholds = model_spike_thresholds(model)
+    reset_drops = model_reset_drops(model)
 
     for name, (t_ref, v_ref) in reference.items():
         if name not in traces.traces:
             continue
         quantity = traces.quantities.get(name, "")
+        dimension = traces.dimensions.get(name)
+        if dimension is not None and dimension not in ("none", "voltage"):
+            # The reference writes SI; tarjuman's traces are in its own units.
+            # Voltage is already handled when the reference is read, but an
+            # abstract cell's own exposures — an adaptation current in nA, say
+            # — would otherwise be compared against amps.
+            v_ref = np.asarray(from_si(np.asarray(v_ref), dimension))
         result.comparisons.append(
             compare_traces(
                 (t_ref, v_ref),
@@ -919,6 +997,7 @@ def validate_lems(
                 quantity=quantity,
                 is_voltage=_is_voltage(quantity),
                 threshold=_threshold_for(quantity, thresholds),
+                reset_drop=_threshold_for(quantity, reset_drops),
             )
         )
     if not result.comparisons:
@@ -994,7 +1073,7 @@ def convergence_study(
 
 
 def _threshold_for(quantity: str, thresholds: dict[str, float]) -> Optional[float]:
-    """The declared spike threshold for the population a quantity belongs to."""
+    """The entry for the population a quantity belongs to, from any table."""
     if not quantity or not thresholds:
         return None
     try:

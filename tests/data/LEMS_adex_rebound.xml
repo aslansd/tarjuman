@@ -1,0 +1,14 @@
+<Lems>
+<Target component="sim1"/>
+<Include file="Cells.xml"/>
+<Include file="Networks.xml"/>
+<Include file="Inputs.xml"/>
+<Include file="Simulation.xml"/>
+<Include file="adex_rebound.nml"/>
+<Simulation id="sim1" length="300ms" step="0.025ms" target="adexNet">
+    <OutputFile id="of1" fileName="results/adex_rebound.dat">
+        <OutputColumn id="v" quantity="reboundPop[0]/v"/>
+        <OutputColumn id="w" quantity="reboundPop[0]/w"/>
+    </OutputFile>
+</Simulation>
+</Lems>

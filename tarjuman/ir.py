@@ -286,6 +286,10 @@ class PointCell:
     id: str
     kind: str
     params: dict[str, float] = field(default_factory=dict)
+    #: The raw attributes as written.  Cells driven by the LEMS interpreter
+    #: re-read these with the dimensions their ComponentType declares, which is
+    #: more reliable than inferring a dimension from the written unit alone.
+    custom: Optional[CustomComponent] = None
 
 
 # --------------------------------------------------------------------------- #

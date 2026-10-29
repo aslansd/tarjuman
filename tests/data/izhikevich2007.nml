@@ -1,0 +1,12 @@
+<neuroml xmlns="http://www.neuroml.org/schema/neuroml2" id="izh2007">
+    <izhikevich2007Cell id="izTonic"  C="100pF" v0="-60mV" k="0.7nS_per_mV" vr="-60mV" vt="-40mV" vpeak="35mV" a="0.03per_ms" b="-2nS" c="-50mV" d="100pA"/>
+    <izhikevich2007Cell id="izBurst"  C="150pF" v0="-75mV" k="1.2nS_per_mV" vr="-75mV" vt="-45mV" vpeak="50mV" a="0.01per_ms" b="5nS"  c="-56mV" d="130pA"/>
+    <pulseGenerator id="pulse1" delay="50ms" duration="400ms" amplitude="0.1nA"/>
+    <pulseGenerator id="pulse2" delay="50ms" duration="400ms" amplitude="0.6nA"/>
+    <network id="izhNet">
+        <population id="popTonic" component="izTonic" size="1"/>
+        <population id="popBurst" component="izBurst" size="1"/>
+        <explicitInput target="popTonic[0]" input="pulse1" destination="synapses"/>
+        <explicitInput target="popBurst[0]" input="pulse2" destination="synapses"/>
+    </network>
+</neuroml>

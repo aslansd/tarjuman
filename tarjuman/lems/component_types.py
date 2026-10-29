@@ -32,6 +32,7 @@ __all__ = [
     "DerivedVariable",
     "ConditionalDerivedVariable",
     "EventAction",
+    "Regime",
     "read_component_type",
     "resolve_inheritance",
     "base_kind_of",
@@ -75,14 +76,52 @@ class ConditionalDerivedVariable:
 
 @dataclass
 class EventAction:
-    """An ``OnStart``, ``OnCondition`` or ``OnEvent`` block."""
+    """An ``OnStart``, ``OnEntry``, ``OnCondition`` or ``OnEvent`` block."""
 
-    kind: str  # start | condition | event
+    kind: str  # start | entry | condition | event
     test: Optional[str] = None  # OnCondition
     port: Optional[str] = None  # OnEvent
     #: ``(state variable, expression)`` assignments to apply.
     assignments: list[tuple[str, str]] = field(default_factory=list)
     emits_event: bool = False
+    #: Target of a ``<Transition regime="..."/>`` inside an ``OnCondition``.
+    transition: Optional[str] = None
+
+
+@dataclass
+class Regime:
+    """A LEMS ``<Regime>``: dynamics that apply only while it is active.
+
+    Only one regime is active at a time, and a component switches between them
+    through ``<Transition>``. NeuroML uses this for exactly one thing in
+    practice — the refractory period of ``adExIaFCell`` — so tarjuman stores
+    regimes faithfully and leaves it to each consumer to say whether it can
+    interpret the particular arrangement it finds.
+    """
+
+    name: str
+    initial: bool = False
+    time_derivatives: dict[str, str] = field(default_factory=dict)
+    events: list[EventAction] = field(default_factory=list)
+
+    @property
+    def on_entry(self) -> list[tuple[str, str]]:
+        """Assignments applied on entering this regime, in order."""
+        return [
+            assignment
+            for action in self.events
+            if action.kind == "entry"
+            for assignment in action.assignments
+        ]
+
+    @property
+    def transitions(self) -> list[EventAction]:
+        """``OnCondition`` blocks that leave this regime."""
+        return [
+            action
+            for action in self.events
+            if action.kind == "condition" and action.transition
+        ]
 
 
 @dataclass
@@ -104,6 +143,11 @@ class ComponentType:
     conditional_derived: list[ConditionalDerivedVariable] = field(default_factory=list)
     time_derivatives: dict[str, str] = field(default_factory=dict)
     events: list[EventAction] = field(default_factory=list)
+    #: ``<Regime>`` blocks, in document order. Parsed but not interpreted here:
+    #: a consumer that recognises the arrangement (see
+    #: :func:`tarjuman.cells_lems.flatten_spiking_regimes`) flattens them into
+    #: plain dynamics; otherwise ``unsupported`` keeps the component out.
+    regimes: list[Regime] = field(default_factory=list)
     #: Features of this ComponentType that tarjuman cannot interpret. Empty
     #: for every type it can instantiate.
     unsupported: list[str] = field(default_factory=list)
@@ -284,31 +328,53 @@ def _read_dynamics(element: Element, component: ComponentType, context: str) -> 
             )
         elif tag == "TimeDerivative":
             component.time_derivatives[child.get("variable")] = child.get("value")
-        elif tag in ("OnStart", "OnCondition", "OnEvent", "OnEntry"):
-            action = EventAction(
-                kind={
-                    "OnStart": "start",
-                    "OnEntry": "start",
-                    "OnCondition": "condition",
-                    "OnEvent": "event",
-                }[tag],
-                test=child.get("test"),
-                port=child.get("port"),
-            )
-            for assignment in child:
-                assignment_tag = _strip_ns(assignment.tag)
-                if assignment_tag == "StateAssignment":
-                    action.assignments.append(
-                        (assignment.get("variable"), assignment.get("value"))
-                    )
-                elif assignment_tag == "EventOut":
-                    action.emits_event = True
-            component.events.append(action)
+        elif tag in _EVENT_TAGS:
+            component.events.append(_read_event(child, tag))
         elif tag == "Regime":
-            # Multi-regime dynamics (e.g. a refractory regime).  Recorded so
-            # that instantiating the component fails with a clear message,
-            # rather than the whole document failing to parse.
+            component.regimes.append(_read_regime(child))
+            # Still unsupported by default: only a consumer that recognises the
+            # arrangement may flatten it (point cells do, for the refractory
+            # idiom). Anything else fails with a clear message at instantiation
+            # rather than silently running the wrong dynamics.
             component.unsupported.append("Regime (multi-regime dynamics)")
+
+
+#: ``<Dynamics>`` children that describe an event, and the ``kind`` each maps to.
+_EVENT_TAGS = {
+    "OnStart": "start",
+    "OnEntry": "entry",
+    "OnCondition": "condition",
+    "OnEvent": "event",
+}
+
+
+def _read_event(element: Element, tag: str) -> EventAction:
+    action = EventAction(
+        kind=_EVENT_TAGS[tag], test=element.get("test"), port=element.get("port")
+    )
+    for child in element:
+        child_tag = _strip_ns(child.tag)
+        if child_tag == "StateAssignment":
+            action.assignments.append((child.get("variable"), child.get("value")))
+        elif child_tag == "EventOut":
+            action.emits_event = True
+        elif child_tag == "Transition":
+            action.transition = child.get("regime")
+    return action
+
+
+def _read_regime(element: Element) -> Regime:
+    regime = Regime(
+        name=element.get("name"),
+        initial=element.get("initial", "false").lower() == "true",
+    )
+    for child in element:
+        tag = _strip_ns(child.tag)
+        if tag == "TimeDerivative":
+            regime.time_derivatives[child.get("variable")] = child.get("value")
+        elif tag in _EVENT_TAGS:
+            regime.events.append(_read_event(child, tag))
+    return regime
 
 
 def resolve_inheritance(
@@ -341,6 +407,7 @@ def resolve_inheritance(
         merged.texts.extend(t for t in ancestor.texts if t not in merged.texts)
         merged.state_variables.update(ancestor.state_variables)
         merged.unsupported.extend(ancestor.unsupported)
+        merged.regimes.extend(ancestor.regimes)
         for derived in ancestor.derived_variables:
             merged.derived_variables = [
                 existing

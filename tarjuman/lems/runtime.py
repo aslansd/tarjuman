@@ -67,6 +67,7 @@ class CompiledDynamics:
         component: ComponentType,
         parameters: dict[str, float],
         provided: Optional[set[str]] = None,
+        external_states: Optional[set[str]] = None,
     ):
         self.component = component
         self.parameters = dict(parameters)
@@ -74,6 +75,13 @@ class CompiledDynamics:
         #: synapse, for instance, is handed the presynaptic voltage that a LEMS
         #: synapse reads with ``select="peer/v"``.
         self.provided = set(provided or ())
+        #: State variables the caller integrates rather than this runtime. A
+        #: point cell's ``v`` is the case: Jaxley's own solver advances the
+        #: membrane potential, because only it knows the stimulus and synaptic
+        #: currents flowing into the compartment. Such a variable is still read
+        #: by every expression and may still be assigned by an ``OnCondition``
+        #: — which is how a spike reset reaches Jaxley.
+        self.external_states = set(external_states or ())
 
         unresolved_gathered = [
             name for name in component.gathered_variables if name not in self.provided
@@ -100,7 +108,12 @@ class CompiledDynamics:
             )
 
         self.constants = {name: value for name, (value, _) in component.constants.items()}
-        self.state_names = list(component.state_variables)
+        #: State variables this runtime integrates, in declaration order.
+        self.state_names = [
+            name
+            for name in component.state_variables
+            if name not in self.external_states
+        ]
 
         self._derived = self._compile_derived()
         self._time_derivatives = {
@@ -216,22 +229,59 @@ class CompiledDynamics:
         return context
 
     def initial_states(self, requirements: dict) -> dict:
-        """Apply ``OnStart``, giving the initial value of each state variable."""
+        """Apply ``OnStart``, giving the initial value of each state variable.
+
+        Externally integrated variables start from ``requirements`` where the
+        caller gave a value, and are returned if ``OnStart`` assigns them: a
+        point cell's resting potential comes from this.
+        """
         states = {name: jnp.array(0.0) for name in self.state_names}
+        for name in self.external_states:
+            states[name] = requirements.get(name, jnp.array(0.0))
         context = self.evaluate(states, requirements)
         for variable, function in self._on_start:
             states[variable] = function(context)
             context[variable] = states[variable]
         return states
 
-    def step(self, states: dict, requirements: dict, dt: float) -> dict:
-        """Advance the state variables by ``dt`` seconds (SI)."""
-        if not self._time_derivatives:
-            return self._apply_conditions(dict(states), requirements)
+    def step(
+        self,
+        states: dict,
+        requirements: dict,
+        dt: float,
+        apply_conditions: bool = True,
+    ) -> dict:
+        """Advance the state variables by ``dt`` seconds (SI).
+
+        ``states`` may include the externally integrated variables; they are
+        read but not advanced, and are returned with whatever an
+        ``OnCondition`` assigned to them.
+
+        Args:
+            states: State values in SI.
+            requirements: Everything else the expressions read, in SI.
+            dt: Time step in seconds.
+            apply_conditions: Whether to apply ``OnCondition`` assignments
+                here. A caller that must test them against a different
+                voltage than the one it integrated on — see
+                :meth:`apply_conditions` — passes ``False`` and calls that
+                itself.
+        """
+        integrable = {
+            name: derivative
+            for name, derivative in self._time_derivatives.items()
+            if name not in self.external_states
+        }
+        if not integrable:
+            return (
+                self._apply_conditions(dict(states), requirements)
+                if apply_conditions
+                else dict(states)
+            )
 
         context = self.evaluate(states, requirements)
         updated = dict(states)
-        for name, derivative in self._time_derivatives.items():
+        for name, derivative in integrable.items():
             value = states[name]
             f0 = derivative(context)
 
@@ -251,7 +301,31 @@ class CompiledDynamics:
             updated[name] = jnp.where(
                 jnp.abs(slope) < _MIN_RATE, explicit, exponential
             )
-        return self._apply_conditions(updated, requirements)
+        return (
+            self._apply_conditions(updated, requirements)
+            if apply_conditions
+            else updated
+        )
+
+    def apply_conditions(self, states: dict, requirements: dict) -> dict:
+        """Apply ``OnCondition`` assignments to ``states`` (all in SI).
+
+        Separate from :meth:`step` because a caller may need to test the
+        conditions against a state it did not integrate: a point cell tests
+        its spike condition against the voltage the step is *about* to
+        produce, since that is what NeuroML's own explicit integrator does.
+        """
+        return self._apply_conditions(dict(states), requirements)
+
+    def derivative(self, name: str, states: dict, requirements: dict):
+        """Evaluate one ``TimeDerivative`` in SI units."""
+        if name not in self._time_derivatives:
+            raise ParseError(
+                f"ComponentType '{self.component.name}' gives no TimeDerivative "
+                f"for '{name}'."
+            )
+        context = self.evaluate(states, requirements)
+        return self._time_derivatives[name](context)
 
     def _apply_conditions(self, states: dict, requirements: dict) -> dict:
         if not self._on_condition:

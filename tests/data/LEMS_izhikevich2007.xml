@@ -1,0 +1,16 @@
+<Lems>
+<Target component="sim1"/>
+<Include file="Cells.xml"/>
+<Include file="Networks.xml"/>
+<Include file="Inputs.xml"/>
+<Include file="Simulation.xml"/>
+<Include file="izhikevich2007.nml"/>
+<Simulation id="sim1" length="500ms" step="0.01ms" target="izhNet">
+    <OutputFile id="of1" fileName="results/izh.dat">
+        <OutputColumn id="vTonic" quantity="popTonic[0]/v"/>
+        <OutputColumn id="uTonic" quantity="popTonic[0]/u"/>
+        <OutputColumn id="vBurst" quantity="popBurst[0]/v"/>
+        <OutputColumn id="uBurst" quantity="popBurst[0]/u"/>
+    </OutputFile>
+</Simulation>
+</Lems>

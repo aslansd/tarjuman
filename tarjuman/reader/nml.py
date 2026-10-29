@@ -950,12 +950,33 @@ def _read_root(
         elif tag == "cell":
             cell = _read_cell(element, document, root, report)
             document.cells[cell.id] = cell
-        elif tag in _POINT_CELL_TAGS:
+        elif tag in _POINT_CELL_TAGS or (
+            tag in custom_types and custom_types[tag][1] == "point_cell"
+        ):
+            # LEMS lets a document instantiate a subtype through its base tag
+            # and name the real type in `type`: c302 parameter set B writes
+            # `<iafCell type="iafActivityCell" .../>`. Taking the tag at face
+            # value there would build a plain integrate-and-fire cell and
+            # quietly drop the state variables the subtype adds.
+            declared = element.get("type")
+            kind = declared if declared in custom_types else tag
             document.point_cells[element.get("id")] = ir.PointCell(
                 id=element.get("id"),
-                kind=tag,
-                params=_read_params(element, f"{tag} '{element.get('id')}'"),
+                kind=kind,
+                params=_read_params(element, f"{kind} '{element.get('id')}'"),
+                custom=ir.CustomComponent(
+                    id=element.get("id"),
+                    component_type=kind,
+                    attributes=dict(element.attrib),
+                ),
             )
+            if declared is not None and declared not in custom_types:
+                report.unsupported(
+                    f"{tag} '{element.get('id')}'",
+                    f"declares type='{declared}', which no ComponentType in this "
+                    f"document defines; converted as a plain {tag} instead, so "
+                    "anything that type adds is missing",
+                )
         elif tag in _SYNAPSE_TAGS:
             synapse_id = element.get("id")
             synapse = ir.Synapse(

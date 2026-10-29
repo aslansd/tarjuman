@@ -455,7 +455,9 @@ def build_network(
         if component in document.point_cells and component not in prototypes:
             try:
                 prototype, morphology = build_point_cell(
-                    document.point_cells[component], report
+                    document.point_cells[component],
+                    report,
+                    component_types=document.component_types,
                 )
             except Exception as error:
                 report.unsupported(f"population '{population.id}'", str(error))
@@ -506,8 +508,10 @@ def build_network(
         )
         raise ParseError(
             f"Network '{network_id}' has no populations tarjuman can convert: "
-            f"{described or 'the network has no populations'}. tarjuman converts "
-            "multicompartmental NeuroML cells; abstract point cells and spike "
+            f"{described or 'the network has no populations'}. The warnings above "
+            "say why each one was rejected; `model.report.summary()` collects "
+            "them. tarjuman converts multicompartmental cells and the abstract "
+            "cells that carry a capacitance; dimensionless cells and spike "
             "sources are not supported yet."
         )
 

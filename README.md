@@ -119,13 +119,30 @@ includes it could not find if that happens.
 | c302 parameter set | what it needs | status |
 |---|---|---|
 | **A** | `iafCell` populations, `expTwoSynapse` | ✅ runs |
-| **B** | a custom integrate-and-fire cell gathering synaptic input with `select="synapses[*]/i"` | ❌ see *Known limits* |
+| **B** | `iafActivityCell`, a custom integrate-and-fire cell with an activity trace, gathering synaptic input with `select="synapses[*]/i"` | ✅ runs |
 | **C** | `gateHHtauInf`, a `customHGate` reading `caConc`, `fixedFactorConcentrationModel`, `expTwoSynapse`, `gapJunction` | ✅ runs |
 | **C0 / C1 / C2** | as C, plus Kunert-style `gradedSynapse2` defined in the model | ✅ runs |
 | **D / W2D** | `custom_muscle_components.xml` (`MuscleSigmoidVariable`, `muscleConcentrationModel`) | ⚠️ converts; muscle models not yet validated |
 
 `c302_C_Oscillator` — 14 cells, 79 synapses, a calcium pool per cell and a
 calcium-dependent gate — runs 1000 ms in about ten seconds on a CPU.
+
+**Every parameter set now runs.** Set B was the last holdout, and what blocked
+it was its own cell type: `iafActivityCell`, defined in `cell_B.xml`, extends
+`iafCell` with an activity trace and reads its synaptic current with
+`<DerivedVariable select="synapses[*]/i" reduce="add"/>`. See *Abstract cells*
+for how that is resolved.
+
+```bash
+tarjuman run      c302/examples/LEMS_c302_B_Oscillator.xml
+tarjuman validate c302/examples/LEMS_c302_B_Oscillator.xml
+tarjuman converge c302/examples/LEMS_c302_B_Oscillator.xml --steps 0.05 0.02 0.005
+```
+
+Against jnml, 26 of its 28 traces pass and all 14 activity traces agree with
+r ≥ 0.991. The two that do not are the pacemaker cells driving the oscillator,
+where the inter-spike interval difference falls from 0.185 ms at `dt = 0.05` to
+0.017 ms at `dt = 0.005` — discretisation, converging away.
 
 ## Python API
 
@@ -191,6 +208,63 @@ correct in a coherent unit system and Jaxley's (mV, ms, µm, nA, S/cm²) is not
 one, so parameters are converted to SI on the way in and exposures converted
 back on the way out, using the dimensions the `ComponentType` declares.
 
+## Abstract cells
+
+`izhikevich2007Cell`, `adExIaFCell` and the integrate-and-fire cells models
+define for themselves are LEMS ComponentTypes carrying a membrane equation, a
+few state variables and a reset rule. tarjuman does not reimplement them:
+`tarjuman/_cell_types.py` is generated from the `Cells.xml` shipped with
+NeuroML2 and holds those ComponentTypes verbatim, so the same interpreter that
+runs a model's own custom types runs the standard cells too.
+
+```bash
+tarjuman validate tests/data/LEMS_izhikevich2007.xml
+tarjuman validate tests/data/LEMS_adex_rebound.xml
+```
+
+The work splits with Jaxley along one line. **Jaxley integrates the voltage**,
+because only it knows the stimulus and synaptic currents arriving at the
+compartment; the cell contributes the current its equations describe, which is
+the LEMS `dv/dt` multiplied by `C`. **The interpreter integrates everything
+else** — an adaptation current, a recovery variable, an activity trace — and
+applies the `OnCondition` assignments, including the one that writes `v` on a
+spike, so the reset is exact rather than approximated.
+
+That split is what resolves `<DerivedVariable select="synapses[*]/i"
+reduce="add"/>`, the construct every NeuroML abstract cell uses to read its
+total synaptic current, and which earlier releases refused. The cell does not
+need to *read* that sum; it needs the sum to reach its membrane equation, and
+Jaxley's solver puts it there already. Evaluating the LEMS term as zero and
+letting the solver supply the real one gives the same equation. This is what
+unblocked c302 parameter set B.
+
+### Where a spiking equation needs explicit integration
+
+An AdEx cell's `exp((v - VT) / delT)` is designed to diverge: the divergence
+*is* the spike, cut short by the reset. That makes the membrane conductance
+regenerative — negative, and growing without bound — about 12 mV above `VT`.
+Jaxley's implicit step infers that conductance from a finite difference and
+inverts `C/dt + dI/dv`, so once the feedback passes `C/dt` the step changes
+sign and the voltage flies off the wrong way: NeuroML's own `adExRebound`
+parameters reached **-156 mV**, resetting on seven consecutive steps.
+
+The region cannot be stepped over either — `adExRebound` turns regenerative
+around -42 mV while its detection threshold sits at -30 mV, several steps
+away. So the cell measures the feedback in its own equation each step, and
+where one step of it would exceed half of `C/dt`, integrates the voltage
+itself, explicitly and in sub-steps, stopping at the threshold. Everywhere
+else, which is all of the sub-threshold trace, Jaxley solves as before with
+the stimulus and synapses included.
+
+The reset is tested against the voltage the step is *about* to produce rather
+than the one it starts from. That is not an approximation: jLEMS integrates
+explicitly, forms `v + dt dv/dt`, finds it above threshold and stores the
+reset, so the overshoot appears in neither simulator's output.
+
+Measured against jnml, the rebound burst comes out at three spikes for every
+time step from 0.025 ms down — 211.95 / 214.44 / 218.64 ms against jnml's
+211.94 / 214.45 / 218.66 ms.
+
 ## What gets converted
 
 | NeuroML | Status |
@@ -218,10 +292,14 @@ back on the way out, using the dimensions the `ComponentType` declares.
 | Recording `iDensity`, `gDensity`, `fopen` | ✅ |
 | `ionChannelKS`, `gateKS` | ❌ not yet |
 | `channelDensityGHK` | ❌ not yet |
-| `izhikevich2007Cell`, `adExIaFCell`, `pointCellCondBased`, PyNN cells | ❌ not yet |
+| `izhikevich2007Cell`, `adExIaFCell`, `hindmarshRose1984Cell` | ✅ interpreted from their LEMS dynamics |
+| abstract cells a model defines itself, including via `<iafCell type="...">` | ✅ |
+| `<DerivedVariable select="synapses[*]/i">` in a cell | ✅ supplied by Jaxley's solver |
+| LEMS `<Regime>` — the spike-and-refractory arrangement | ✅ |
+| dimensionless cells (`izhikevichCell`, `fitzHughNagumoCell`, `baseCellMembPotDL`) | ❌ not yet |
+| `pointCellCondBased`, PyNN cells | ❌ not yet |
 | Spike sources (`spikeArray`, `spikeGenerator*`, `poissonFiringSynapse`) | ❌ not yet |
-| `<DerivedVariable select="synapses[*]/i">` in a cell | ❌ see *Known limits* |
-| LEMS `<Regime>` (multi-regime dynamics) | ❌ not yet |
+| LEMS `<Regime>` — any other arrangement | ❌ refused with a reason |
 
 Nothing on the ⚠️ or ❌ rows is ever dropped quietly. Every conversion returns
 a report:
@@ -243,12 +321,22 @@ analytic 20.794 ms), but writing the voltage on a threshold crossing is a step
 function, so the gradient through a spike is zero. Sub-threshold parameters
 stay differentiable. Jaxley's own `Fire` mechanism carries the same caveat.
 
-**Cells that gather their own synaptic input.** A LEMS cell reads its synaptic
-current with `<DerivedVariable select="synapses[*]/i" reduce="add"/>`. In
-Jaxley that sum is assembled by the network, not read by the cell, so such a
-cell type cannot be interpreted as written. This is what blocks c302 parameter
-set B. Parsing does not fail — only instantiating that component does, with an
-explanation.
+**A cell's own `iSyn` and `iMemb` cannot be recorded.** A LEMS cell reads its
+synaptic current with `<DerivedVariable select="synapses[*]/i" reduce="add"/>`,
+and tarjuman resolves that by evaluating the term as zero and letting Jaxley's
+solver supply the real sum, which it assembles anyway — see *Abstract cells*
+below. The equation is the same, but the cell never computes the sum itself, so
+an exposure derived from it has no value here. Recording one is refused rather
+than answered with the membrane current minus the synapses. Record `v`, or the
+cell's own state variables, which are available.
+
+**Dimensionless cells are not supported.** `izhikevichCell` (the 2003 form),
+`fitzHughNagumoCell` and anything else extending `baseCellMembPotDL` carry no
+capacitance and are driven by dimensionless currents (`basePointCurrentDL`).
+tarjuman drives abstract cells through Jaxley's own membrane equation, which
+needs a capacitance. Use `izhikevich2007Cell`, which is the dimensioned form of
+the same model and is NeuroML's recommendation. The conversion reports which
+cell was rejected and why.
 
 **`iafTauCell` has no current term.** It extends `baseIaf`, not
 `baseIafCapCell`, so in NeuroML an injected current does nothing to it at all;
@@ -373,6 +461,23 @@ Measured on the NeuroML example suite:
 | `Ex19_GapJunctions` — electrical coupling | jLEMS | spikes 3 vs 3, RMS **0.02 mV** |
 | `Ex20_AnalogSynapses` — graded transmission | jLEMS | spike counts equal |
 | `Ex10_Q10` — temperature-scaled gates | jLEMS | spikes 3 vs 3, RMS **0.93 mV** |
+| `Ex0_IaF` — four integrate-and-fire variants | jLEMS | spike counts equal, RMS **0.005–0.022 mV** |
+| `Ex8_AdEx` — four AdEx cells, voltage and adaptation | jLEMS | 7 of 8 traces; RMS **0.06–0.24 mV** on the bursting cells, **0.11 mV** on the rebound cell |
+| `izhikevich2007Cell` — tonic and bursting | jLEMS | spike counts equal, RMS **0.06** and **0.40 mV**, recovery variable r > 0.995 |
+| `c302 parameter set B` — 14 cells, 79 synapses, activity traces | jLEMS | 26 of 28 traces; all 14 activity traces r ≥ **0.991** |
+
+The eighth trace of `Ex8_AdEx` is `adExBurstChaos`, and the name is the
+finding. Run jnml against *itself* at two different time steps and it
+disagrees by **more** than tarjuman disagrees with it — sub-threshold RMS
+1.104 mV and 0.555 ms/ISI drift, against tarjuman's 1.149 mV and
+0.517 ms/ISI, both giving 20 spikes. That trace measures the model's
+sensitivity to initial conditions, not a translation error.
+
+The two failing traces of `c302 parameter set B` are the pacemaker cells
+driving the oscillator, and a convergence study says why: the mean
+inter-spike interval difference falls from 0.185 ms at `dt = 0.05` to
+**0.017 ms at `dt = 0.005`** — 0.65% down to 0.06%, the same
+explicit-versus-implicit difference measured for the HH cell below.
 
 Across the whole suite: of the 31 models, 15 use NeuroML features tarjuman
 cannot yet convert and one jLEMS cannot run. **Of the 14 that both simulators
@@ -511,13 +616,14 @@ pip install -e ".[dev]"
 brew install --cask temurin          # macOS: a real JDK for jnml
 xcode-select --install               # macOS: a compiler for NEURON's mod files
 
-pytest -q                                              # 126 tests
+pytest -q                                              # 145 tests
 python tests/neuroml/run.py                            # 7 conversions
 
 python examples/01_run_neuroml_cell.py
 python examples/02_fit_a_channel_parameter.py
 python examples/03_c302_connectome.py $C302/examples/LEMS_c302_C_Oscillator.xml
 python examples/04_validate_against_jnml.py $NML/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml
+python examples/05_abstract_cells.py
 
 tarjuman info     $NML/examples/NML2_SingleCompHHCell.nml
 tarjuman convert  $NML/examples/NML2_SingleCompHHCell.nml --script hh.py
@@ -526,6 +632,10 @@ tarjuman run      $C302/examples/LEMS_c302_C_Oscillator.xml --plot oscillator.pn
 tarjuman validate tests/data/LEMS_hh_single_comp.xml
 tarjuman validate $NML/LEMSexamples/LEMS_NML2_Ex25_MultiComp.xml   # via NEURON
 tarjuman converge tests/data/LEMS_hh_single_comp.xml
+tarjuman validate tests/data/LEMS_izhikevich2007.xml
+tarjuman validate tests/data/LEMS_adex_rebound.xml
+tarjuman validate $NML/LEMSexamples/LEMS_NML2_Ex8_AdEx.xml
+tarjuman validate $C302/examples/LEMS_c302_B_Oscillator.xml   # parameter set B
 ```
 
 The rest of this section is what each of those prints.
@@ -543,6 +653,7 @@ python examples/03_c302_connectome.py  c302/examples/LEMS_c302_C_Oscillator.xml
 python examples/04_validate_against_jnml.py \
     NeuroML2/LEMSexamples/LEMS_NML2_Ex5_DetCell.xml
 python examples/04_validate_against_jnml.py LEMS_NML2_Ex5_DetCell.xml --converge
+python examples/05_abstract_cells.py
 ```
 
 `01` converts a Hodgkin-Huxley cell, prints the branch geometry and writes
@@ -567,6 +678,16 @@ step  50  loss     2.2555  naChans_gbar 0.1205
 recovered 0.1196 S/cm2 (NeuroML file says 0.12)
 ```
 
+`05` runs NeuroML's abstract cells and prints the table that shows where an
+AdEx cell's own equation stops being safe for an implicit solver:
+
+```
+    v (mV)   feedback*dt   integrated by     v out
+     -45.0        0.2373          Jaxley    -45.00
+     -43.0        0.6496        the cell    -41.08
+     -40.0        2.9205        the cell    -51.00  <- reset
+```
+
 `03` converts the C. elegans connectome and reports what is now trainable:
 
 ```
@@ -582,12 +703,12 @@ e.g. model.module.make_trainable('CaPool_decayConstant') to fit the pool to data
 Two of them, answering different questions.
 
 ```bash
-pytest -q                           # 126 tests: the package's own behaviour
+pytest -q                           # 145 tests: the package's own behaviour
 python tests/neuroml/run.py         # 7 models: conversions against NeuroML
 ```
 
 ```
-126 passed
+145 passed
 7/7 passed
 ```
 
@@ -647,10 +768,9 @@ Two things belong in Jaxley rather than here, and `tarjuman` works around both:
 
 1. Kinetic-scheme channels (`ionChannelKS`).
 2. Spike sources (`spikeArray`, `spikeGeneratorPoisson`) as presynaptic drivers.
-3. The remaining point cells. Jaxley already ships `AdEx` and `Izhikevich`
-   mechanisms in `jaxley.channels.non_capacitive`, so `adExIaFCell` and
-   `izhikevich2007Cell` should map onto them directly rather than needing a
-   bespoke implementation.
+3. Dimensionless cells: `baseCellMembPotDL` and `basePointCurrentDL`, which
+   between them cover `izhikevichCell`, `fitzHughNagumoCell` and the
+   dimensionless inputs that drive them.
 4. `channelDensityNernst` computed from the pool, and `channelDensityGHK`.
 5. A CI job comparing traces against `pynml`/`jnml` across the NeuroML example
    suite and the c302 parameter sets.

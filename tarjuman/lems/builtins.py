@@ -19,9 +19,33 @@ Transcribed from the NeuroML 2 core types
 
 from __future__ import annotations
 
-from .component_types import ComponentType, EventAction, StateVariable
+import xml.etree.ElementTree as ET
+from functools import lru_cache
 
-__all__ = ["BUILTIN_COMPONENT_TYPES", "builtin_registry"]
+from .component_types import ComponentType, EventAction, StateVariable, read_component_type
+
+__all__ = ["BUILTIN_COMPONENT_TYPES", "builtin_registry", "cell_component_types"]
+
+
+@lru_cache(maxsize=1)
+def _cell_types() -> dict[str, ComponentType]:
+    """The abstract cell types, read from the canonical LEMS definitions.
+
+    Unlike the base types below, these are not transcribed: ``_cell_types.py``
+    carries the ComponentTypes verbatim from ``Cells.xml``, so the point cells
+    are driven by the same interpreter as a model's own types rather than
+    reimplemented. See ``tools/generate_cell_types.py``.
+    """
+    from .._cell_types import CELL_TYPES_XML
+
+    root = ET.fromstring(CELL_TYPES_XML)
+    types = [read_component_type(element) for element in root]
+    return {component.name: component for component in types}
+
+
+def cell_component_types() -> dict[str, ComponentType]:
+    """A copy of the abstract cell component types, by name."""
+    return dict(_cell_types())
 
 
 def _concentration_model() -> ComponentType:
@@ -221,7 +245,9 @@ def builtin_registry() -> dict[str, ComponentType]:
         _graded_synapse_base("baseGradedSynapse"),
         _graded_synapse_base("baseGradedSynapseDL"),
     ]
-    return {component.name: component for component in types}
+    registry = {component.name: component for component in types}
+    registry.update(cell_component_types())
+    return registry
 
 
 #: The built-in base types, by name.
