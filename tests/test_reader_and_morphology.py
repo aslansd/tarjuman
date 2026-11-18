@@ -133,7 +133,9 @@ def test_electrical_and_continuous_projections_are_read():
 def test_unsupported_components_are_reported_not_raised():
     text = """
     <neuroml id="doc">
-      <ionChannelKS id="ks1"/>
+      <ionChannel id="ch1">
+        <unknownChild id="u1"/>
+      </ionChannel>
       <cell id="c1">
         <morphology id="m">
           <segment id="0"><distal x="0" y="10" z="0" diameter="2"/>
@@ -149,7 +151,7 @@ def test_unsupported_components_are_reported_not_raised():
         warnings.simplefilter("ignore")
         document = read_neuroml_string(text, report=report)
     assert "c1" in document.cells
-    assert any("ionChannelKS" in note.component for note in report.notes)
+    assert any("ch1" in note.component for note in report.notes)
 
 
 # --------------------------------------------------------------------------- #

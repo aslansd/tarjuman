@@ -387,6 +387,7 @@ def _insert_channels(
                 initial_calcium=(
                     pools["ca"].initial_concentration if "ca" in pools else 5e-5
                 ),
+                species=species,
             )
         except Exception as error:
             report.unsupported(f"channelDensity '{density.id}'", str(error))

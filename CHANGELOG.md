@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.0
+
+**Kinetic-scheme ion channels (`ionChannelKS` / `gateKS`) and Goldman-Hodgkin-Katz permeability (`channelDensityGHK`).**
+
+Two core NeuroML 2 channel mechanisms that previously raised `UnsupportedComponentError` now convert, simulate, and differentiate cleanly through JAX:
+
+### Kinetic-scheme channels (`ionChannelKS`, `gateKS`)
+
+- Parses `<ionChannelKS>` containing `<gateKS>` gates with `<closedState>`, `<openState>`, and `<KSState relativeConductance="..."/>` nodes.
+- Supports all four standard transition types (`<forwardTransition>`, `<reverseTransition>`, `<tauInfTransition>`, and `<vHalfTransition>` with `vHalf`, `z`, `gamma`, `tau`, `tauMin` and $k_{Te} = 25.3\text{ mV}$) as well as custom ComponentTypes extending `KSTransition` or driving transition `<rate>`, `<steadyState>`, or `<timeCourse>` children, plus `<q10Settings>` scaling.
+- Integrates the master equation $d\mathbf{p}/dt = Q(v)\,\mathbf{p}$ via exact matrix exponentiation (`jax.scipy.linalg.expm(dt * Q)`), preserving $\sum_i p_i = 1$ and positivity for arbitrary $N$-state Markov schemes at any time step while remaining end-to-end differentiable (`jax.grad` through `vHalf`, `tau`, `rate`, `midpoint`, `scale`).
+- Initializes state occupancies to the exact stationary distribution $Q(v)\,\mathbf{p}_\infty = 0,\;\sum_i p_{\infty,i} = 1$ in `init_state`.
+- Exposes individual state occupancies (`.../gate/state/occupancy`), state conductance contributions (`.../gate/state/q`), and total gate open values (`.../gate/q`) to `tarjuman.simulate` and LEMS `OutputFile` recordings.
+
+### Goldman-Hodgkin-Katz electrodiffusion (`channelDensityGHK`, `channelDensityGHK2`)
+
+- Parses `<channelDensityGHK permeability="...">` (and `<channelDensityGHK2 condDensity="...">`) and passes the ion permeability (`cm/s`), valence (`z = 2` for Ca²⁺), and initial intracellular/extracellular species concentrations (`mM`) into `NeuroMLChannel`.
+- Evaluates the nonlinear GHK current-voltage flux equation in `compute_current` using a smooth removable-singularity formulation at $v = 0\text{ mV}$ so both forward integration and reverse-mode autodiff (`jax.grad` with respect to permeability and channel kinetics) remain well-conditioned.
+- Couples directly with `<species>` + concentration pools (`fixedFactorConcentrationModel`, `decayingPoolConcentrationModel`, and custom pools) via shared ion currents (`i_Ca` / `CaCon_i`), and records `iDensity` in LEMS outputs (`LEMS_NML2_Ex18_GHK.xml`).
+
 ## 0.6.0
 
 **Abstract cells now run, and so does c302 parameter set B.**

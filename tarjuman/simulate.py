@@ -271,6 +271,8 @@ class _Recording:
     states: tuple[str, ...]
     channel: Optional[NeuroMLChannel] = None
     exposure: Optional[str] = None
+    gate_id: Optional[str] = None
+    ks_state_id: Optional[str] = None
     #: LEMS dimension of the recorded quantity, where it is known. ``save``
     #: converts by dimension rather than by guessing from the state's name,
     #: which is what lets an abstract cell's own exposures come out in SI.
@@ -287,11 +289,26 @@ class _Recording:
             for name in channel.channel_params
         }
         v = states["v"]
+        if self.exposure == "gate_q":
+            spec = next(g for g in channel._gates if g.id == self.gate_id)
+            value = channel._gate_value(spec, states, v, params)
+            return np.asarray(jnp.broadcast_to(value, v.shape))
+        if self.exposure == "ks_state_q":
+            spec = next(g for g in channel._gates if g.id == self.gate_id)
+            st = next(s for s in spec.ks_states if s.id == self.ks_state_id)
+            value = st.relative_conductance * states[st.state_name]
+            return np.asarray(jnp.broadcast_to(value, v.shape))
+
         value = channel.compute_open_fraction(states, v, params)
-        if self.exposure in ("iDensity", "gDensity"):
-            value = params[f"{channel.name}_gbar"] * value
         if self.exposure == "iDensity":
-            value = value * (v - params[f"{channel.name}_erev"])
+            if channel._ghk_mode is not None:
+                value = channel._ghk_current(value, v, states, params)
+            else:
+                value = params[f"{channel.name}_gbar"] * value * (
+                    v - params[f"{channel.name}_erev"]
+                )
+        elif self.exposure == "gDensity":
+            value = params[f"{channel.name}_gbar"] * value
         return np.asarray(jnp.broadcast_to(value, v.shape))
 
 
@@ -341,8 +358,15 @@ def _recording_view(model: ConvertedModel, parsed: dict):
             raise ParseError(f"Unknown ion channel in output path {quantity!r}.")
         if parsed["gate"] is not None:
             channel = model.document.ion_channels[density.ion_channel]
-            if not any(gate.id == parsed["gate"] for gate in channel.gates):
+            gate = next((g for g in channel.gates if g.id == parsed["gate"]), None)
+            if gate is None:
                 raise ParseError(f"Unknown gate in output path {quantity!r}.")
+            if parsed.get("ks_state") is not None:
+                if not any(s.id == parsed["ks_state"] for s in gate.ks_states):
+                    raise ParseError(
+                        f"Unknown kinetic-scheme state {parsed['ks_state']!r} in "
+                        f"output path {quantity!r}."
+                    )
 
     return model.view(
         population,
@@ -397,7 +421,16 @@ def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
     if parsed["density"] is not None:
         name = parsed["density"]
         channel = next(
-            (channel for channel in model.module.channels if channel.name == name),
+            (
+                channel
+                for channel in model.module.channels
+                if channel.name == name
+                and (
+                    parsed["channel"] is None
+                    or getattr(getattr(channel, "neuroml", None), "id", None)
+                    == parsed["channel"]
+                )
+            ),
             None,
         )
         if not isinstance(channel, NeuroMLChannel) or not bool(
@@ -409,7 +442,9 @@ def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
             )
         if parsed["gate"] is None:
             supported = (
-                ("iDensity", "gDensity") if parsed["channel"] is None else ("fopen",)
+                (("iDensity",) if channel._ghk_mode == "channelDensityGHK" else ("iDensity", "gDensity"))
+                if parsed["channel"] is None
+                else ("fopen",)
             )
             if state not in supported:
                 raise ParseError(f"Unsupported channel output path {quantity!r}.")
@@ -419,10 +454,57 @@ def _add_recording(model: ConvertedModel, quantity: str) -> _Recording:
             for dependency in states:
                 view.record(dependency, verbose=False)
             return _Recording(quantity, view.nodes.index[0], states, channel, state)
-        if state != "q":
-            raise ParseError(f"Unsupported gate output {quantity!r}; only q is recorded.")
-        # Jaxley names gate states "<channelDensity id>_<gate id>".
-        jaxley_state = f"{parsed['density']}_{parsed['gate']}"
+        if parsed.get("ks_state") is not None:
+            ks_state_name = f"{parsed['density']}_{parsed['gate']}_{parsed['ks_state']}"
+            if state == "occupancy":
+                jaxley_state = ks_state_name
+            elif state == "q":
+                states = ("v", ks_state_name)
+                for dependency in states:
+                    view.record(dependency, verbose=False)
+                return _Recording(
+                    quantity,
+                    view.nodes.index[0],
+                    states,
+                    channel,
+                    "ks_state_q",
+                    gate_id=parsed["gate"],
+                    ks_state_id=parsed["ks_state"],
+                )
+            else:
+                raise ParseError(
+                    f"Unsupported kinetic-scheme state output {quantity!r}; "
+                    "expected 'occupancy' or 'q'."
+                )
+        else:
+            if state != "q":
+                raise ParseError(
+                    f"Unsupported gate output {quantity!r}; only q is recorded."
+                )
+            gate_spec = next(
+                (g for g in channel._gates if g.id == parsed["gate"]), None
+            )
+            if gate_spec is not None and (
+                gate_spec.kind == "gateKS" or gate_spec.sub_gates
+            ):
+                dep_names = (
+                    [s.state_name for s in gate_spec.ks_states]
+                    if gate_spec.kind == "gateKS"
+                    else [s.state_name for s in gate_spec.sub_gates]
+                )
+                states = tuple(dict.fromkeys(["v", *dep_names]))
+                for dependency in states:
+                    view.record(dependency, verbose=False)
+                return _Recording(
+                    quantity,
+                    view.nodes.index[0],
+                    states,
+                    channel,
+                    "gate_q",
+                    gate_id=parsed["gate"],
+                )
+            # Jaxley names gate states "<channelDensity id>_<gate id>".
+            jaxley_state = f"{parsed['density']}_{parsed['gate']}"
 
     elif state == "v":
         jaxley_state = "v"

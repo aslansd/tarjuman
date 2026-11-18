@@ -290,8 +290,8 @@ time step from 0.025 ms down — 211.95 / 214.44 / 218.64 ms against jnml's
 | `gateFractional` and `subGate` (weighted subgate kinetics) | ✅ |
 | Custom `timeCourse`/`steadyState` reading the parent gate's `alpha`/`beta` | ✅ |
 | Recording `iDensity`, `gDensity`, `fopen` | ✅ |
-| `ionChannelKS`, `gateKS` | ❌ not yet |
-| `channelDensityGHK` | ❌ not yet |
+| `ionChannelKS`, `gateKS` (`vHalfTransition`, `forward/reverseTransition`, `tauInfTransition`) | ✅ |
+| `channelDensityGHK`, `channelDensityGHK2` | ✅ |
 | `izhikevich2007Cell`, `adExIaFCell`, `hindmarshRose1984Cell` | ✅ interpreted from their LEMS dynamics |
 | abstract cells a model defines itself, including via `<iafCell type="...">` | ✅ |
 | `<DerivedVariable select="synapses[*]/i">` in a cell | ✅ supplied by Jaxley's solver |
@@ -766,12 +766,12 @@ Two things belong in Jaxley rather than here, and `tarjuman` works around both:
 
 ## Roadmap
 
-1. Kinetic-scheme channels (`ionChannelKS`).
+1. ~~Kinetic-scheme channels (`ionChannelKS`).~~ — shipped in 0.7.0.
 2. Spike sources (`spikeArray`, `spikeGeneratorPoisson`) as presynaptic drivers.
 3. Dimensionless cells: `baseCellMembPotDL` and `basePointCurrentDL`, which
    between them cover `izhikevichCell`, `fitzHughNagumoCell` and the
    dimensionless inputs that drive them.
-4. `channelDensityNernst` computed from the pool, and `channelDensityGHK`.
+4. `channelDensityNernst` computed from the pool (~~`channelDensityGHK`~~ shipped in 0.7.0).
 5. A CI job comparing traces against `pynml`/`jnml` across the NeuroML example
    suite and the c302 parameter sets.
 6. Validated muscle models, and the rest of the OpenWorm stack.
