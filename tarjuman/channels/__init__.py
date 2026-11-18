@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 from jax import Array
 from jax.typing import ArrayLike
 from jaxley.channels import Channel
@@ -51,6 +52,16 @@ DEFAULT_TEMPERATURE = 279.45  # K
 #: Below this, a time constant counts as instantaneous.
 _MIN_TAU = 1e-9
 
+#: Boltzmann thermal voltage constant in NeuroML2 vHalfTransition (25.3 mV).
+_VHALF_KTE_MV = 25.3
+
+#: Physical constants for Goldman-Hodgkin-Katz electrodiffusion (NeuroML2 Cells.xml).
+_GHK_R = 8.3144621  # J / (K * mol)
+_GHK_F = 96485.3    # C / mol
+_GHK_Z_CA = 2.0
+#: Conversion from (cm/s) * (C/mol) * mM to mA/cm2: 1e-3 * 1e-3 * 1e3 = 1e-3.
+_GHK_PERM_CONC_F_TO_MA_CM2 = 1e-3
+
 _RATES_FROM_ALPHA_BETA = {"gateHHrates", "gateHHratesTau"}
 _TAU_FROM_ALPHA_BETA = {"gateHHrates", "gateHHratesInf"}
 
@@ -75,6 +86,35 @@ def _sole_exposure(dynamics: CompiledDynamics, preferred: str) -> str:
         f"ComponentType '{dynamics.component.name}' exposes nothing tarjuman can "
         "use as a rate, steady state or time course."
     )
+
+
+@dataclass
+class _KSStateSpec:
+    """One occupancy state inside a kinetic-scheme gate."""
+
+    id: str
+    state_name: str  # Jaxley state name: "<prefix>_<gate>_<state>"
+    relative_conductance: float
+
+
+@dataclass
+class _KSTransitionSpec:
+    """One transition between two states inside a kinetic-scheme gate."""
+
+    id: str
+    kind: str
+    from_idx: int
+    to_idx: int
+    rate_fn: Optional[Callable] = None
+    rate_params: tuple[str, ...] = ()
+    steady_state_fn: Optional[Callable] = None
+    steady_state_params: tuple[str, ...] = ()
+    tau_param: Optional[str] = None
+    vhalf_params: Optional[tuple[str, str, str, str, str]] = None
+    dynamics: Optional[CompiledDynamics] = None
+    custom_params: dict[str, tuple[str, float]] = field(default_factory=dict)
+    part_dynamics: dict[str, CompiledDynamics] = field(default_factory=dict)
+    part_params: dict[str, dict[str, tuple[str, float]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -107,6 +147,9 @@ class _GateSpec:
     sub_gates: list["_GateSpec"] = field(default_factory=list)
     #: Jaxley parameter holding this subgate's dimensionless weight.
     fractional_conductance_param: Optional[str] = None
+    #: Kinetic-scheme states and transitions for ``gateKS``.
+    ks_states: list[_KSStateSpec] = field(default_factory=list)
+    ks_transitions: list[_KSTransitionSpec] = field(default_factory=list)
 
 
 class NeuroMLChannel(Channel):
@@ -133,6 +176,9 @@ class NeuroMLChannel(Channel):
         component_types: Optional[dict] = None,
         current_name: Optional[str] = None,
         initial_calcium: float = 5e-5,
+        ghk_mode: Optional[str] = None,
+        permeability: Optional[float] = None,
+        ext_calcium: float = 2.0,
     ):
         self.current_is_in_mA_per_cm2 = True
         super().__init__(name or channel.id)
@@ -140,15 +186,31 @@ class NeuroMLChannel(Channel):
         self.neuroml = channel
         self.temperature = temperature
         self.component_types = component_types or {}
+        self._ghk_mode = ghk_mode
         prefix = self._name
 
-        self.channel_params = {
-            f"{prefix}_gbar": float(cond_density),
-            # Named after the NeuroML attribute rather than "_e": Jaxley keeps
-            # parameters and states in one table, and gates are often called
-            # "e" (the calcium activation gate of Boyle & Cohen, for one).
-            f"{prefix}_erev": float(erev),
-        }
+        if ghk_mode == "channelDensityGHK":
+            self.channel_params = {
+                f"{prefix}_perm": float(permeability or 0.0),
+                f"{prefix}_caConc": float(initial_calcium),
+                f"{prefix}_caConcExt": float(ext_calcium),
+                f"{prefix}_T": float(temperature),
+            }
+        elif ghk_mode == "channelDensityGHK2":
+            self.channel_params = {
+                f"{prefix}_gbar": float(cond_density),
+                f"{prefix}_caConc": float(initial_calcium),
+                f"{prefix}_caConcExt": float(ext_calcium),
+                f"{prefix}_T": float(temperature),
+            }
+        else:
+            self.channel_params = {
+                f"{prefix}_gbar": float(cond_density),
+                # Named after the NeuroML attribute rather than "_e": Jaxley keeps
+                # parameters and states in one table, and gates are often called
+                # "e" (the calcium activation gate of Boyle & Cohen, for one).
+                f"{prefix}_erev": float(erev),
+            }
         self.channel_states: dict[str, float] = {}
         #: Channels of the same ion share a current name so that concentration
         #: models can see the total current of that ion, as NeuroML's `iCa`
@@ -178,7 +240,9 @@ class NeuroMLChannel(Channel):
                 "parameter and a state. Jaxley keeps them in one table, so the "
                 "names have to differ; rename the gate in the NeuroML file."
             )
-        self.needs_calcium = any(gate.needs_calcium for gate in self._gates)
+        self.needs_calcium = any(gate.needs_calcium for gate in self._gates) or (
+            ghk_mode in ("channelDensityGHK", "channelDensityGHK2")
+        )
         if self.needs_calcium:
             self.channel_states[CALCIUM_STATE] = float(initial_calcium)
 
@@ -212,6 +276,8 @@ class NeuroMLChannel(Channel):
 
         if gate.kind == "gateFractional":
             return self._build_fractional_gate(gate, spec, base)
+        if gate.kind == "gateKS":
+            return self._build_ks_gate(gate, spec, base)
         for part, component in gate.custom_parts.items():
             dynamics, parameters, needs_calcium = self._compile_custom(
                 component, f"{base}_{part}"
@@ -267,6 +333,215 @@ class NeuroMLChannel(Channel):
             spec.sub_gates.append(child_spec)
         spec.needs_calcium = any(child.needs_calcium for child in spec.sub_gates)
         return spec
+
+    def _build_ks_gate(
+        self, gate: ir.Gate, spec: _GateSpec, base: str
+    ) -> _GateSpec:
+        """Build states and transitions for a kinetic-scheme gate (``gateKS``)."""
+        if not gate.ks_states:
+            raise UnsupportedComponentError(
+                f"Kinetic-scheme gate '{gate.id}' has no states."
+            )
+
+        state_index: dict[str, int] = {}
+        n_states = len(gate.ks_states)
+        for idx, ks_state in enumerate(gate.ks_states):
+            state_name = f"{base}_{ks_state.id}"
+            state_index[ks_state.id] = idx
+            spec.ks_states.append(
+                _KSStateSpec(
+                    id=ks_state.id,
+                    state_name=state_name,
+                    relative_conductance=float(ks_state.relative_conductance),
+                )
+            )
+            self.channel_states[state_name] = 1.0 / n_states
+
+        for tr in gate.ks_transitions:
+            t_base = f"{base}_{tr.id}"
+            t_spec = _KSTransitionSpec(
+                id=tr.id,
+                kind=tr.kind,
+                from_idx=state_index[tr.from_state],
+                to_idx=state_index[tr.to_state],
+            )
+            if tr.custom is not None:
+                dynamics, parameters, needs_calcium = self._compile_custom(
+                    tr.custom, t_base
+                )
+                t_spec.dynamics = dynamics
+                t_spec.custom_params = parameters
+                spec.needs_calcium |= needs_calcium
+            else:
+                for part, component in tr.custom_parts.items():
+                    dynamics, parameters, needs_calcium = self._compile_custom(
+                        component, f"{t_base}_{part}"
+                    )
+                    t_spec.part_dynamics[part] = dynamics
+                    t_spec.part_params[part] = parameters
+                    spec.needs_calcium |= needs_calcium
+
+                if tr.rate is not None:
+                    t_spec.rate_fn = RATE_FUNCTIONS[tr.rate.kind]
+                    t_spec.rate_params = self._register_rate(f"{t_base}_rate", tr.rate)
+                if tr.steady_state is not None:
+                    t_spec.steady_state_fn = VARIABLE_FUNCTIONS[tr.steady_state.kind]
+                    t_spec.steady_state_params = self._register_rate(
+                        f"{t_base}_inf", tr.steady_state
+                    )
+                if tr.time_course is not None:
+                    t_spec.tau_param = f"{t_base}_tau"
+                    self.channel_params[t_spec.tau_param] = float(tr.time_course.tau)
+                if tr.kind == "vHalfTransition":
+                    names = (
+                        f"{t_base}_vHalf",
+                        f"{t_base}_z",
+                        f"{t_base}_gamma",
+                        f"{t_base}_tau",
+                        f"{t_base}_tauMin",
+                    )
+                    self.channel_params[names[0]] = float(tr.v_half)
+                    self.channel_params[names[1]] = float(tr.z)
+                    self.channel_params[names[2]] = float(tr.gamma)
+                    self.channel_params[names[3]] = float(tr.tau)
+                    self.channel_params[names[4]] = float(tr.tau_min)
+                    t_spec.vhalf_params = names
+
+            spec.ks_transitions.append(t_spec)
+
+        return spec
+
+    def _transition_rates(
+        self,
+        t_spec: _KSTransitionSpec,
+        v: ArrayLike,
+        params: dict[str, Array],
+        states: dict,
+    ) -> tuple[ArrayLike, ArrayLike]:
+        """Unscaled forward (``rf``) and reverse (``rr``) rates in 1/ms."""
+        if t_spec.dynamics is not None:
+            context = self._custom_context(t_spec.custom_params, v, states, params)
+            values = t_spec.dynamics.evaluate({}, context)
+            rf = from_si(values.get("rf", 0.0), "per_time")
+            rr = from_si(values.get("rr", 0.0), "per_time")
+            return jnp.asarray(rf), jnp.asarray(rr)
+
+        if t_spec.kind == "forwardTransition":
+            if t_spec.rate_fn is not None:
+                rf = t_spec.rate_fn(v, *(params[p] for p in t_spec.rate_params))
+            else:
+                dynamics = t_spec.part_dynamics["rate"]
+                ctx = self._custom_context(t_spec.part_params["rate"], v, states, params)
+                vals = dynamics.evaluate({}, ctx)
+                name = "r" if "r" in vals else _sole_exposure(dynamics, "r")
+                rf = from_si(vals[name], "per_time")
+            return jnp.asarray(rf), jnp.asarray(0.0)
+
+        if t_spec.kind == "reverseTransition":
+            if t_spec.rate_fn is not None:
+                rr = t_spec.rate_fn(v, *(params[p] for p in t_spec.rate_params))
+            else:
+                dynamics = t_spec.part_dynamics["rate"]
+                ctx = self._custom_context(t_spec.part_params["rate"], v, states, params)
+                vals = dynamics.evaluate({}, ctx)
+                name = "r" if "r" in vals else _sole_exposure(dynamics, "r")
+                rr = from_si(vals[name], "per_time")
+            return jnp.asarray(0.0), jnp.asarray(rr)
+
+        if t_spec.kind == "tauInfTransition":
+            if t_spec.steady_state_fn is not None:
+                inf = t_spec.steady_state_fn(
+                    v, *(params[p] for p in t_spec.steady_state_params)
+                )
+            else:
+                dynamics = t_spec.part_dynamics["steady_state"]
+                ctx = self._custom_context(
+                    t_spec.part_params["steady_state"], v, states, params
+                )
+                vals = dynamics.evaluate({}, ctx)
+                name = "x" if "x" in vals else _sole_exposure(dynamics, "x")
+                inf = from_si(vals[name], "none")
+
+            if t_spec.tau_param is not None:
+                tau = params[t_spec.tau_param]
+            else:
+                dynamics = t_spec.part_dynamics["time_course"]
+                ctx = self._custom_context(
+                    t_spec.part_params["time_course"], v, states, params
+                )
+                vals = dynamics.evaluate({}, ctx)
+                name = "t" if "t" in vals else _sole_exposure(dynamics, "t")
+                tau = from_si(vals[name], "time")
+
+            safe_tau = jnp.where(tau > _MIN_TAU, tau, _MIN_TAU)
+            return jnp.asarray(inf / safe_tau), jnp.asarray((1.0 - inf) / safe_tau)
+
+        if t_spec.kind == "vHalfTransition":
+            v_half, z, gamma, tau, tau_min = (
+                params[p] for p in t_spec.vhalf_params
+            )
+            dv = (v - v_half) / _VHALF_KTE_MV
+            rf0 = jnp.exp(jnp.minimum(z * gamma * dv, 30.0)) / tau
+            rr0 = jnp.exp(jnp.minimum(-z * (1.0 - gamma) * dv, 30.0)) / tau
+            rf = rf0 / (1.0 + rf0 * tau_min)
+            rr = rr0 / (1.0 + rr0 * tau_min)
+            return jnp.asarray(rf), jnp.asarray(rr)
+
+        raise UnsupportedComponentError(
+            f"Unsupported kinetic-scheme transition kind {t_spec.kind!r}."
+        )
+
+    def _ks_generator_matrix(
+        self,
+        spec: _GateSpec,
+        v: ArrayLike,
+        params: dict[str, Array],
+        states: dict,
+    ) -> Array:
+        """Build the ``(N, N)`` transition rate matrix ``Q`` (in 1/ms) for ``dp/dt = Q @ p``."""
+        n = len(spec.ks_states)
+        rate_scale = params[spec.rate_scale_param]
+        dtype = jnp.asarray(v, dtype=float).dtype
+        Q = jnp.zeros((n, n), dtype=dtype)
+        for tr in spec.ks_transitions:
+            rf, rr = self._transition_rates(tr, v, params, states)
+            rf = jnp.squeeze(rf * rate_scale)
+            rr = jnp.squeeze(rr * rate_scale)
+            u, w = tr.from_idx, tr.to_idx
+            Q = Q.at[w, u].add(rf)
+            Q = Q.at[u, u].add(-rf)
+            Q = Q.at[u, w].add(rr)
+            Q = Q.at[w, w].add(-rr)
+        return Q
+
+    def _ks_steady_state(
+        self,
+        spec: _GateSpec,
+        v: ArrayLike,
+        params: dict[str, Array],
+        states: dict,
+    ) -> Array:
+        """Exact stationary occupancy vector solving ``Q @ p = 0, sum(p) = 1``."""
+        n = len(spec.ks_states)
+        Q = self._ks_generator_matrix(spec, v, params, states)
+        A = Q.at[-1, :].set(1.0)
+        b = jnp.zeros((n,), dtype=Q.dtype).at[-1].set(1.0)
+        return jnp.linalg.solve(A, b)
+
+    def _step_ks_gate(
+        self,
+        spec: _GateSpec,
+        dt: float,
+        v: ArrayLike,
+        params: dict[str, Array],
+        states: dict,
+    ) -> dict[str, Array]:
+        """Exact matrix-exponential step ``p(t + dt) = expm(dt * Q(v)) @ p(t)``."""
+        Q = self._ks_generator_matrix(spec, v, params, states)
+        p0 = jnp.stack([states[s.state_name] for s in spec.ks_states])
+        p1 = jsp_linalg.expm(dt * Q) @ p0
+        p1 = p1 / jnp.sum(p1)
+        return {s.state_name: p1[idx] for idx, s in enumerate(spec.ks_states)}
 
     def _compile_custom(
         self, component: ir.CustomComponent, base: str
@@ -554,6 +829,9 @@ class NeuroMLChannel(Channel):
         for spec in self._kinetic_gates:
             if spec.is_instantaneous:
                 continue
+            if spec.kind == "gateKS":
+                updated.update(self._step_ks_gate(spec, dt, v, params, states))
+                continue
             inf, tau = self._inf_and_tau(spec, v, params, states)
             safe_tau = jnp.where(tau > _MIN_TAU, tau, _MIN_TAU)
             stepped = solve_inf_gate_exponential(
@@ -571,6 +849,11 @@ class NeuroMLChannel(Channel):
         params: dict[str, Array],
     ) -> ArrayLike:
         """Gate q, including the weighted subgate sum of a fractional gate."""
+        if spec.kind == "gateKS":
+            return sum(
+                s.relative_conductance * states[s.state_name]
+                for s in spec.ks_states
+            )
         if spec.sub_gates:
             return sum(
                 params[child.fractional_conductance_param]
@@ -602,14 +885,59 @@ class NeuroMLChannel(Channel):
         """LEMS ``fopen`` at the supplied state, including conductance scaling."""
         return self._conductance_scaling * self._gate_product(states, v, params)
 
+    def _ghk_current(
+        self,
+        fopen: ArrayLike,
+        v: ArrayLike,
+        states: dict[str, Array],
+        params: dict[str, Array],
+    ) -> ArrayLike:
+        """Outward-positive GHK current density in mA/cm2."""
+        prefix = self._name
+        T = params[f"{prefix}_T"]
+        ca_ext = params[f"{prefix}_caConcExt"]
+        ca_int = states.get(CALCIUM_STATE, params[f"{prefix}_caConc"])
+
+        if self._ghk_mode == "channelDensityGHK":
+            perm = params[f"{prefix}_perm"]
+            x = (_GHK_Z_CA * _GHK_F * (v * 1e-3)) / (_GHK_R * T)
+            safe_x = jnp.where(jnp.abs(x) < 1e-7, 1.0, x)
+            phi = jnp.where(
+                jnp.abs(x) < 1e-7,
+                1.0 + 0.5 * x + (x * x) / 12.0,
+                safe_x / (1.0 - jnp.exp(-safe_x)),
+            )
+            flux = (
+                fopen
+                * perm
+                * _GHK_Z_CA
+                * _GHK_F
+                * _GHK_PERM_CONC_F_TO_MA_CM2
+                * phi
+                * (ca_int - ca_ext * jnp.exp(-x))
+            )
+            return jnp.where(ca_ext > 0.0, flux, 0.0)
+
+        g_density = params[f"{prefix}_gbar"] * fopen
+        tmp = (25.0 * T) / (293.15 * 2.0)
+        ratio = v / tmp
+        safe_ratio = jnp.where(jnp.abs(ratio) < 1e-7, 1.0, ratio)
+        ghk_factor = jnp.where(
+            jnp.abs(ratio) < 1e-7,
+            1.0 - 0.5 * ratio,
+            safe_ratio / (jnp.exp(safe_ratio) - 1.0),
+        )
+        v_drive = tmp * (1.0 - (ca_int / jnp.maximum(ca_ext, 1e-30)) * jnp.exp(ratio)) * ghk_factor
+        return jnp.where(ca_ext > 0.0, -g_density * v_drive, 0.0)
+
     def compute_current(
         self, states: dict[str, Array], v: float, params: dict[str, Array]
     ) -> Array:
-        """Current density in mA/cm2 (``gbar * prod(q^instances) * (v - e)``)."""
-        open_fraction = self._gate_product(states, v, params)
-        conductance = (
-            params[f"{self._name}_gbar"] * open_fraction * self._conductance_scaling
-        )
+        """Current density in mA/cm2 (``gbar * prod(q^instances) * (v - e)`` or GHK)."""
+        fopen = self.compute_open_fraction(states, v, params)
+        if self._ghk_mode is not None:
+            return self._ghk_current(fopen, v, states, params)
+        conductance = params[f"{self._name}_gbar"] * fopen
         return conductance * (v - params[f"{self._name}_erev"])
 
     def init_state(
@@ -623,6 +951,11 @@ class NeuroMLChannel(Channel):
         initial: dict[str, ArrayLike] = {}
         for spec in self._kinetic_gates:
             if spec.is_instantaneous:
+                continue
+            if spec.kind == "gateKS":
+                p_inf = self._ks_steady_state(spec, v, params, states)
+                for idx, s in enumerate(spec.ks_states):
+                    initial[s.state_name] = p_inf[idx]
                 continue
             inf, _ = self._inf_and_tau(spec, v, params, states)
             initial[spec.state_name] = inf
@@ -638,6 +971,7 @@ def make_channel(
     component_types: Optional[dict] = None,
     current_name: Optional[str] = None,
     initial_calcium: float = 5e-5,
+    species: Optional[ir.Species] = None,
 ) -> NeuroMLChannel:
     """Build a Jaxley channel for one ``channelDensity`` of one ion channel.
 
@@ -666,6 +1000,14 @@ def make_channel(
     if erev is None:
         erev = erev_override if erev_override is not None else 0.0
     channel_name = name or (density.id if density is not None else channel.id)
+    ghk_mode = density.kind if (density is not None and density.is_ghk) else None
+    permeability = density.permeability if density is not None else None
+    ca_int = (
+        species.initial_concentration
+        if species is not None
+        else initial_calcium
+    )
+    ca_ext = species.initial_ext_concentration if species is not None else 2.0
     return NeuroMLChannel(
         channel,
         name=channel_name,
@@ -674,5 +1016,8 @@ def make_channel(
         temperature=temperature,
         component_types=component_types,
         current_name=current_name,
-        initial_calcium=initial_calcium,
+        initial_calcium=ca_int,
+        ghk_mode=ghk_mode,
+        permeability=permeability,
+        ext_calcium=ca_ext,
     )

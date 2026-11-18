@@ -19,6 +19,8 @@ __all__ = [
     "Variable",
     "TimeCourse",
     "Q10",
+    "KSState",
+    "KSTransition",
     "Gate",
     "IonChannel",
     "CustomComponent",
@@ -101,13 +103,41 @@ class Q10:
 
 
 @dataclass
+class KSState:
+    """One state of a kinetic-scheme gate (``closedState``, ``openState``, ``KSState``)."""
+
+    id: str
+    relative_conductance: float = 0.0
+
+
+@dataclass
+class KSTransition:
+    """A directed transition between two states in a ``gateKS``."""
+
+    id: str
+    kind: str  # forwardTransition | reverseTransition | tauInfTransition | vHalfTransition | custom
+    from_state: str
+    to_state: str
+    rate: Optional[Rate] = None
+    steady_state: Optional[Variable] = None
+    time_course: Optional[TimeCourse] = None
+    v_half: Optional[float] = None  # mV
+    z: Optional[float] = None
+    gamma: Optional[float] = None
+    tau: Optional[float] = None  # ms
+    tau_min: Optional[float] = None  # ms
+    custom: Optional["CustomComponent"] = None
+    custom_parts: dict[str, "CustomComponent"] = field(default_factory=dict)
+
+
+@dataclass
 class Gate:
     """One gating variable of an ion channel, raised to ``instances``."""
 
     id: str
     instances: int
     kind: str  # gateHHrates | gateHHtauInf | gateHHratesTau | gateHHratesInf
-    # | gateHHratesTauInf | gateHHInstantaneous | a custom ComponentType name
+    # | gateHHratesTauInf | gateHHInstantaneous | gateFractional | gateKS | a custom ComponentType name
     forward_rate: Optional[Rate] = None
     reverse_rate: Optional[Rate] = None
     steady_state: Optional[Variable] = None
@@ -120,6 +150,8 @@ class Gate:
     custom_parts: dict[str, "CustomComponent"] = field(default_factory=dict)
     sub_gates: list["Gate"] = field(default_factory=list)
     fractional_conductance: Optional[float] = None
+    ks_states: list[KSState] = field(default_factory=list)
+    ks_transitions: list[KSTransition] = field(default_factory=list)
 
     @property
     def is_custom(self) -> bool:
@@ -170,12 +202,18 @@ class ChannelDensity:
 
     id: str
     ion_channel: str
-    cond_density: float  # S/cm2
+    cond_density: float = 0.0  # S/cm2
     erev: Optional[float] = None  # mV
     segment_group: str = "all"
     ion: Optional[str] = None
     kind: str = "channelDensity"
     variable_parameters: list[VariableParameter] = field(default_factory=list)
+    v_shift: float = 0.0  # mV
+    permeability: Optional[float] = None  # cm/s (for channelDensityGHK)
+
+    @property
+    def is_ghk(self) -> bool:
+        return self.kind in ("channelDensityGHK", "channelDensityGHK2")
 
 
 @dataclass

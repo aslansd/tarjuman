@@ -161,6 +161,7 @@ def parse_quantity_path(quantity: str) -> dict:
         "density": None,
         "channel": None,
         "gate": None,
+        "ks_state": None,
         "component": None,
         "biophysics": None,
         "raw": quantity,
@@ -187,14 +188,19 @@ def parse_quantity_path(quantity: str) -> dict:
 
     if len(rest) == 1:
         result["state"] = rest[0]
-    elif len(rest) in (4, 5, 6) and rest[1] == "membraneProperties":
+    elif len(rest) == 2 and not rest[0].isdigit():
+        result["component"] = rest[0]
+        result["state"] = rest[1]
+    elif len(rest) in (4, 5, 6, 7) and rest[1] == "membraneProperties":
         result["biophysics"] = rest[0]
         result["density"] = rest[2]
         result["state"] = rest[-1]
         if len(rest) >= 5:
             result["channel"] = rest[3]
-        if len(rest) == 6:
+        if len(rest) >= 6:
             result["gate"] = rest[4]
+        if len(rest) == 7:
+            result["ks_state"] = rest[5]
     else:
         raise ParseError(f"Unsupported quantity path {quantity!r}.")
     return result

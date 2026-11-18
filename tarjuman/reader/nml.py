@@ -49,6 +49,7 @@ _ION_CHANNEL_TAGS = {
     "ionChannelHH",
     "ionChannelPassive",
     "ionChannelVShift",
+    "ionChannelKS",
 }
 _GATE_TAGS = {
     "gate",
@@ -60,6 +61,14 @@ _GATE_TAGS = {
     "gateHHInstantaneous",
     "gateFractional",
     "gateKS",
+}
+_KS_STATE_TAGS = {"KSState", "closedState", "openState"}
+_KS_TRANSITION_TAGS = {
+    "forwardTransition",
+    "reverseTransition",
+    "tauInfTransition",
+    "vHalfTransition",
+    "KSTransition",
 }
 _ION_CHANNEL_METADATA_TAGS = {
     "notes",
@@ -215,6 +224,118 @@ def _read_q10(element: ET.Element, context: str) -> ir.Q10:
     raise ParseError(f"Unsupported q10Settings type {kind!r} in {context}.")
 
 
+def _read_ks_state(element: ET.Element, context: str) -> ir.KSState:
+    kind = _component_type(element)
+    state_id = element.get("id")
+    if not state_id:
+        raise ParseError(f"{context} has a {kind} without an 'id'.")
+    if kind == "closedState":
+        rel_cond = 0.0
+    elif kind == "openState":
+        rel_cond = 1.0
+    elif kind == "KSState":
+        raw = element.get("relativeConductance")
+        if raw is None:
+            raise ParseError(
+                f"{context} KSState '{state_id}' is missing relativeConductance."
+            )
+        rel_cond = float(raw)
+    else:
+        raise ParseError(f"Unsupported kinetic-scheme state type {kind!r} in {context}.")
+    return ir.KSState(id=state_id, relative_conductance=rel_cond)
+
+
+def _read_ks_transition(
+    element: ET.Element, context: str, custom_types: Optional[dict] = None
+) -> ir.KSTransition:
+    custom_types = custom_types or {}
+    kind = _component_type(element)
+    from_state = element.get("from")
+    to_state = element.get("to")
+    if not from_state or not to_state:
+        raise ParseError(
+            f"{context} transition '{element.get('id', kind)}' must specify 'from' and 'to'."
+        )
+    trans_id = element.get("id") or f"{from_state}_to_{to_state}"
+    trans_ctx = f"{context} transition '{trans_id}'"
+
+    if kind in custom_types:
+        return ir.KSTransition(
+            id=trans_id,
+            kind=kind,
+            from_state=from_state,
+            to_state=to_state,
+            custom=ir.CustomComponent(
+                id=trans_id, component_type=kind, attributes=dict(element.attrib)
+            ),
+        )
+
+    if kind not in _KS_TRANSITION_TAGS:
+        raise ParseError(
+            f"Unsupported kinetic-scheme transition type {kind!r} in {context}."
+        )
+
+    transition = ir.KSTransition(
+        id=trans_id,
+        kind=kind,
+        from_state=from_state,
+        to_state=to_state,
+    )
+
+    if kind in ("forwardTransition", "reverseTransition"):
+        rate_el = _first(element, "rate")
+        if rate_el is None:
+            raise ParseError(f"{trans_ctx} is missing <rate>.")
+        rate_kind = _component_type(rate_el)
+        if rate_kind in custom_types:
+            transition.custom_parts["rate"] = ir.CustomComponent(
+                id=rate_el.get("id"),
+                component_type=rate_kind,
+                attributes=dict(rate_el.attrib),
+            )
+        else:
+            transition.rate = _read_rate(rate_el, trans_ctx)
+
+    elif kind == "tauInfTransition":
+        ss_el = _first(element, "steadyState")
+        tc_el = _first(element, "timeCourse")
+        if ss_el is None or tc_el is None:
+            raise ParseError(
+                f"{trans_ctx} requires both <steadyState> and <timeCourse>."
+            )
+        ss_kind = _component_type(ss_el)
+        if ss_kind in custom_types:
+            transition.custom_parts["steady_state"] = ir.CustomComponent(
+                id=ss_el.get("id"),
+                component_type=ss_kind,
+                attributes=dict(ss_el.attrib),
+            )
+        else:
+            transition.steady_state = _read_variable(ss_el, trans_ctx)
+
+        tc_kind = _component_type(tc_el)
+        if tc_kind in custom_types:
+            transition.custom_parts["time_course"] = ir.CustomComponent(
+                id=tc_el.get("id"),
+                component_type=tc_kind,
+                attributes=dict(tc_el.attrib),
+            )
+        else:
+            transition.time_course = _read_time_course(tc_el, trans_ctx)
+
+    elif kind == "vHalfTransition":
+        for attr in ("vHalf", "z", "gamma", "tau", "tauMin"):
+            if element.get(attr) is None:
+                raise ParseError(f"{trans_ctx} is missing required attribute '{attr}'.")
+        transition.v_half = to_jaxley(element.get("vHalf"), "voltage", trans_ctx)
+        transition.z = float(element.get("z"))
+        transition.gamma = float(element.get("gamma"))
+        transition.tau = to_jaxley(element.get("tau"), "time", trans_ctx)
+        transition.tau_min = to_jaxley(element.get("tauMin"), "time", trans_ctx)
+
+    return transition
+
+
 def _read_gate(
     element: ET.Element, context: str, custom_types: Optional[dict] = None
 ) -> ir.Gate:
@@ -258,6 +379,32 @@ def _read_gate(
         if fraction is None:
             raise ParseError(f"{context} is missing fractionalConductance.")
         gate.fractional_conductance = float(fraction)
+    elif kind == "gateKS":
+        for child in element:
+            child_tag = _tag(child)
+            child_kind = _component_type(child)
+            if child_tag in _KS_STATE_TAGS or child_kind in _KS_STATE_TAGS:
+                gate.ks_states.append(_read_ks_state(child, context))
+            elif (
+                child_tag in _KS_TRANSITION_TAGS
+                or child_kind in _KS_TRANSITION_TAGS
+                or child_kind in custom_types
+            ):
+                gate.ks_transitions.append(
+                    _read_ks_transition(child, context, custom_types)
+                )
+        if not gate.ks_states:
+            raise ParseError(f"{context} has no states.")
+        state_ids = [s.id for s in gate.ks_states]
+        if len(state_ids) != len(set(state_ids)):
+            raise ParseError(f"{context} has duplicate state ids.")
+        state_id_set = set(state_ids)
+        for tr in gate.ks_transitions:
+            if tr.from_state not in state_id_set or tr.to_state not in state_id_set:
+                raise ParseError(
+                    f"{context} transition '{tr.id}' references unknown state "
+                    f"({tr.from_state!r} -> {tr.to_state!r}); known states: {state_ids}."
+                )
     for part, part_element, reader in (
         ("forward_rate", forward, _read_rate),
         ("reverse_rate", reverse, _read_rate),
@@ -293,17 +440,10 @@ def _read_ion_channel(
         for name, component in custom_types.items()
         if component[1] == "gate"
     }
-    gates: list[ir.Gate] = []
-    for gate_element in _children(element, *gate_tags):
-        gate_kind = _component_type(gate_element)
-        if gate_kind == "gateKS":
-            report.unsupported(
-                context,
-                f"gate '{gate_element.get('id')}' is a {gate_kind}; kinetic-scheme "
-                "gates are not yet translated, the gate is skipped",
-            )
-            continue
-        gates.append(_read_gate(gate_element, context, custom_types))
+    gates: list[ir.Gate] = [
+        _read_gate(gate_element, context, custom_types)
+        for gate_element in _children(element, *gate_tags)
+    ]
 
     for child in element:
         tag = _tag(child)
@@ -434,20 +574,28 @@ def _read_biophysics(
                 continue
             density_id = density_element.get("id")
             density_context = f"{context} {tag} '{density_id}'"
-            if tag in ("channelDensityGHK", "channelDensityGHK2"):
-                report.unsupported(
-                    density_context,
-                    "Goldman-Hodgkin-Katz permeability is not supported; "
-                    "the channel is skipped",
+            cond_density_val = 0.0
+            permeability_val = None
+            if tag == "channelDensityGHK":
+                perm_text = density_element.get("permeability")
+                if perm_text is None:
+                    raise ParseError(
+                        f"{density_context} has no 'permeability'."
+                    )
+                permeability_val = to_jaxley(
+                    perm_text, "permeability", density_context
                 )
-                continue
-            cond_density = density_element.get("condDensity")
-            if cond_density is None:
-                report.unsupported(
-                    density_context,
-                    "no condDensity given (non-uniform density); the channel is skipped",
+            else:
+                cond_density = density_element.get("condDensity")
+                if cond_density is None:
+                    report.unsupported(
+                        density_context,
+                        "no condDensity given (non-uniform density); the channel is skipped",
+                    )
+                    continue
+                cond_density_val = to_jaxley(
+                    cond_density, "conductanceDensity", density_context
                 )
-                continue
             erev = density_element.get("erev")
             if erev is None and tag == "channelDensityNernst":
                 report.approximation(
@@ -456,13 +604,17 @@ def _read_biophysics(
                     "Jaxley does not integrate here; erev must be supplied via "
                     "`erev_overrides` or the channel current will be wrong",
                 )
+            v_shift_text = density_element.get("vShift")
+            v_shift_val = (
+                to_jaxley(v_shift_text, "voltage", density_context)
+                if v_shift_text is not None
+                else 0.0
+            )
             biophysics.channel_densities.append(
                 ir.ChannelDensity(
                     id=density_id,
                     ion_channel=density_element.get("ionChannel"),
-                    cond_density=to_jaxley(
-                        cond_density, "conductanceDensity", density_context
-                    ),
+                    cond_density=cond_density_val,
                     erev=(
                         to_jaxley(erev, "voltage", density_context)
                         if erev is not None
@@ -471,6 +623,8 @@ def _read_biophysics(
                     segment_group=density_element.get("segmentGroup", "all") or "all",
                     ion=density_element.get("ion"),
                     kind=tag,
+                    v_shift=v_shift_val,
+                    permeability=permeability_val,
                 )
             )
         biophysics.specific_capacitance = _read_value_group_pairs(
@@ -910,12 +1064,18 @@ def _read_root(
         tag = _tag(element)
         if tag == "ComponentType":
             continue
-        if tag in _CONCENTRATION_MODEL_TAGS or (
-            tag in custom_types and custom_types[tag][1] == "concentration_model"
+        comp_type = _component_type(element)
+        if (
+            tag in _CONCENTRATION_MODEL_TAGS
+            or comp_type in _CONCENTRATION_MODEL_TAGS
+            or (
+                comp_type in custom_types
+                and custom_types[comp_type][1] == "concentration_model"
+            )
         ):
             document.concentration_models[element.get("id")] = ir.ConcentrationModel(
                 id=element.get("id"),
-                kind=tag,
+                kind=comp_type,
                 ion=element.get("ion", "ca"),
                 attributes=dict(element.attrib),
             )
@@ -942,11 +1102,7 @@ def _read_root(
                     "the vShift attribute is ignored; rates are used unshifted",
                 )
             document.ion_channels[channel.id] = channel
-        elif tag == "ionChannelKS":
-            report.unsupported(
-                f"ionChannelKS '{element.get('id')}'",
-                "kinetic-scheme channels are not yet translated",
-            )
+
         elif tag == "cell":
             cell = _read_cell(element, document, root, report)
             document.cells[cell.id] = cell
